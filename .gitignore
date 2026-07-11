@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PM 临时 / 备份
+*.md.bak
+*.bak
+tmp_*.py
+tmp_*.txt
+fix_mojibake.py
+
+# 项目运行产物
+logs/
+*.log
+
+# 原始生产数据（红线）
+data/raw/
+*.csv.bak
+
+# 子项目 tmp/ 目录（测试探针、临时脚本）
+projects/dateanalysis-desktop/tmp/
+tmp/
+
+# OpenClaw 运行状态
+.precheck/
+openclaw-workspace-state.json
+
+# Codex / 代理工作临时文件
+_w.txt
+.codex/
