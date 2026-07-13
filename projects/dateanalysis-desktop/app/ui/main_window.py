@@ -63,8 +63,9 @@ from app.ui.widgets.descriptive_charts_panel import DescriptiveChartsPanel
 from app.ui.widgets.descriptive_panel import DescriptivePanel
 from app.ui.widgets.process_analysis_panel import ProcessAnalysisPanel
 from app.services.process_analysis import build_analysis_report, infer_columns
+from app.services.head_tail_attribution import build_head_tail_report
 from app.services.ai_client import AIClient, AIClientError
-from app.services.ai_prompt import build_insight_prompt
+from app.services.ai_prompt import build_insight_prompt, build_head_tail_prompt
 
 
 class MainWindow(QMainWindow):
@@ -77,8 +78,15 @@ class MainWindow(QMainWindow):
         self._stats_df: pd.DataFrame | None = None
         self._desc_tables: dict[str, pd.DataFrame] = {}
         self._column_cache: dict[str, dict[str, set]] = {}
-        self._busy = False
+        # W12.1: 粒度锁（替代原单一 _busy）：
+        #  dataset_busy  —— 会改动数据集（导入/合并/处理/激活切换），彼此互斥；
+        #  analysis_busy —— 分析/绘图/描述统计/工艺分析，同一时刻只允许一个（共享 QProgressDialog）；
+        # AI 请求不占锁（面板自管状态，支持软取消），允许多锁间并行（dataset/analysis/AI 互不阻塞）。
+        self._dataset_busy = False
+        self._analysis_busy = False
+        self._ai_cancel_event = None
         self._progress: QProgressDialog | None = None
+        self._progress_lock_label: str = ""
         self._threadpool = QThreadPool.globalInstance()
         self._settings = QSettings("DateAnalysis", "DateAnalysis")
         self._last_import_dir = self._settings.value("last_import_dir", str(Path.home()), type=str)
@@ -299,26 +307,72 @@ class MainWindow(QMainWindow):
         elif mode_id == 1: self.log("已切换到：描述统计模式")
         else: self.log("已切换到：时序监控模式")
 
-    def _set_busy(self, busy: bool, label: str = "处理中...") -> None:
-        self._busy = busy
+    def _set_busy(self, lock: str, busy: bool, label: str = "处理中...", cancel_event=None) -> None:
+        """Show/hide global QProgressDialog and set the corresponding fine-grained lock.
+
+        lock: 'dataset' | 'analysis'. AI path does not use the global dialog (pass lock='none' to _run_background).
+        cancel_event: 可选 threading.Event。若提供且非 None，QProgressDialog 取消按钮文案改为"取消"，点击时 set 该事件以触发软终止。
+        """
+        if lock == "dataset":
+            self._dataset_busy = bool(busy)
+        elif lock == "analysis":
+            self._analysis_busy = bool(busy)
+        elif lock == "none":
+            return
+        else:
+            raise ValueError(f"unknown busy lock: {lock}")
+        any_busy = self._dataset_busy or self._analysis_busy
         if busy:
             if self._progress is None:
-                self._progress = QProgressDialog(label, "取消", 0, 0, self); self._progress.setWindowTitle("请稍候")
-                self._progress.setWindowModality(Qt.WindowModality.WindowModal); self._progress.setMinimumDuration(300)
-                self._progress.setCancelButton(None); self._progress.setAutoClose(True); self._progress.setAutoReset(True)
+                self._progress = QProgressDialog(label, None, 0, 100, self)
+                self._progress.setWindowTitle("请稍候")
+                self._progress.setWindowModality(Qt.WindowModality.WindowModal)
+                self._progress.setMinimumDuration(300)
+                self._progress.setAutoClose(True)
+                self._progress.setAutoReset(True)
+                if cancel_event is not None:
+                    self._progress.setCancelButtonText("取消")
+                    def _on_cancel():
+                        try:
+                            cancel_event.set()
+                        except Exception:
+                            pass
+                    self._progress.canceled.connect(_on_cancel)
+                else:
+                    self._progress.setCancelButtonText("后台继续")
+                    try:
+                        self._progress.canceled.connect(self._on_progress_canceled)
+                    except Exception:
+                        pass
             else:
                 self._progress.setLabelText(label)
-            self._progress.setValue(0); self._progress.show(); self.statusBar().showMessage(label)
+            self._progress_lock_label = lock
+            self._progress.setValue(0)
+            self._progress.show()
+            self.statusBar().showMessage(label)
         else:
-            if self._progress is not None: self._progress.close(); self._progress = None
-            self.statusBar().showMessage("就绪")
+            if not any_busy and self._progress is not None:
+                self._progress.close()
+                self._progress = None
+                self._progress_lock_label = ""
+            self.statusBar().showMessage("就绪" if not any_busy else "后台任务进行中...")
+
+    def _on_progress_canceled(self) -> None:
+        # 只是收起视觉弹窗，不中断线程；用户选择后台继续。
+        if self._progress is not None:
+            self._progress.close()
+            self._progress = None
 
     def _progress_cb(self, pct: int, msg: str = "") -> None:
-        if self._progress is None: return
+        if self._progress is None:
+            return
         self._progress.setValue(max(0, min(100, int(pct))))
         if msg:
-            try: self._progress.setLabelText(msg)
-            except RuntimeError: self._progress = None; return
+            try:
+                self._progress.setLabelText(msg)
+            except RuntimeError:
+                self._progress = None
+                return
             self.statusBar().showMessage(msg)
 
     def _cache_columns_for(self, item) -> dict[str, set]:
@@ -747,7 +801,7 @@ class MainWindow(QMainWindow):
             else: self.log("未勾选Y轴列，已跳过绘图。")
             self.log(f"分析总耗时：{format_duration(r['elapsed'])}")
         def on_error(msg,tb): QMessageBox.critical(self,"分析失败",msg); self.log(f"分析失败：{msg}\n{tb}", level="error")
-        self._run_background("正在分析...", do_work, (), on_success, on_error)
+        self._run_background("正在分析...", do_work, (), on_success, on_error, busy_lock="analysis")
 
     def _run_chart_only(self):
         if self._manager.active_item() is None: QMessageBox.warning(self,"提示","请先导入数据。"); return
@@ -768,7 +822,7 @@ class MainWindow(QMainWindow):
             self._render_chart(ch, r["x_col"], yf or r["y_series"]); self.tabs.setCurrentWidget(self.data_panel)
             self.log(f"绘图完成，耗时 {format_duration(r['elapsed'])}")
         def on_error(msg,tb): QMessageBox.critical(self,"绘图失败",msg); self.log(f"绘图失败：{msg}\n{tb}", level="error")
-        self._run_background("正在绘图...", do_work, (), on_success, on_error)
+        self._run_background("正在绘图...", do_work, (), on_success, on_error, busy_lock="analysis")
 
     def _refresh_chart_if_any(self):
         if self.chart_panel.has_plotted_data(): self._run_chart_only()
@@ -911,7 +965,7 @@ class MainWindow(QMainWindow):
             self.log(f"描述统计完成，共 {len(nc)} 列（总耗时 {format_duration(r['elapsed'])}）。")
             self.tabs.setCurrentWidget(self.stats_panel); self.stats_panel.show_table("综合统计")
         def on_error(msg,tb): QMessageBox.critical(self,"描述统计失败",msg); self.log(f"描述统计失败：{msg}\n{tb}", level="error")
-        self._run_background("正在计算描述统计...", do_work, (), on_success, on_error)
+        self._run_background("正在计算描述统计...", do_work, (), on_success, on_error, busy_lock="analysis")
 
     def _refresh_process_analysis_panel(self):
         active = self._manager.active_item()
@@ -935,67 +989,222 @@ class MainWindow(QMainWindow):
         active = self._manager.active_item()
         if active is None or active.df is None:
             QMessageBox.warning(self,"提示","请先导入并激活一个数据集。"); self.process_analysis_panel.set_running(False); return
-        sc=config.get("state_col"); ts=config.get("target_states"); fc=config.get("feature_cols")
-        if not sc or not fc: QMessageBox.warning(self,"提示","请选择状态列和至少一个特征列。"); self.process_analysis_panel.set_running(False); return
-        df=active.df
-        def do_work(rp=None):
-            if rp: rp(10,"正在识别列与计算统计量...")
-            return build_analysis_report(df,state_col=sc,feature_cols=fc,target_states=ts,min_samples=30)
+        mode = config.get("mode", "state_classify")
+        fc = config.get("feature_cols")
+        if not fc:
+            QMessageBox.warning(self,"提示","请至少选择一个特征列。"); self.process_analysis_panel.set_running(False); return
+        df = active.df
+        if mode == "head_tail_attr":
+            target_col = config.get("target_col", "[机尾]指数-s")
+            cols = [str(c) for c in df.columns]
+            if not any(c.startswith("[机头]") for c in cols) or target_col not in cols:
+                QMessageBox.warning(
+                    self,"提示",
+                    "当前数据未检测到 [机头]*/[机尾]指数-s 列，请先在左侧数据面板点【跨类合同图】合并机头+机尾数据。"
+                )
+                self.process_analysis_panel.set_running(False); return
+            import threading as _tb
+            from app.services.head_tail_attribution import AttributionCancelledError
+            cancel_evt_attr = _tb.Event()
+            def do_work(report_progress=None):
+                if cancel_evt_attr.is_set():
+                    raise AttributionCancelledError("机尾指数-s归因已取消")
+                if report_progress: report_progress(5,"准备数据集...")
+                rep = build_head_tail_report(
+                    df, target_col=target_col, feature_cols=fc,
+                    ideal_value=float(config.get("ideal_value", 4.0) or 4.0),
+                    min_samples=30, report_progress=report_progress,
+                    cancel_event=cancel_evt_attr,
+                )
+                if cancel_evt_attr.is_set():
+                    raise AttributionCancelledError("机尾指数-s归因已取消")
+                return rep
+            def on_success(rep):
+                self.process_analysis_panel.set_running(False)
+                if rep is None: self.log("机尾指数-s归因返回空结果。", level="warning"); return
+                self.process_analysis_panel.set_result(rep, mode="head_tail_attr")
+                if "error" in rep: self.log(f"机尾指数-s归因失败：{rep['error']}", level="warning"); QMessageBox.warning(self,"分析失败",rep["error"]); return
+                self.tabs.setCurrentWidget(self.process_analysis_panel)
+                meta=rep.get("meta",{}); self.log(f"机尾指数-s归因完成：有效配对 {meta.get('n_rows',0)} 行，机头特征 {meta.get('n_head_features',0)} 列。")
+            def on_error(msg,tb):
+                self.process_analysis_panel.set_running(False)
+                if "已取消" in str(msg):
+                    self.log("机尾指数-s归因已被用户取消。", level="info")
+                else:
+                    QMessageBox.critical(self,"归因分析失败",msg)
+                    self.log(f"归因分析失败：{msg}\n{tb}", level="error")
+            self.process_analysis_panel.set_running(True)
+            self._run_background("正在进行机尾指数-s归因分析...", do_work, (), on_success, on_error, busy_lock="analysis", cancel_event=cancel_evt_attr)
+            return
+
+        # state_classify 模式（原流程）
+        import threading as _ta
+        from app.services.process_analysis import AnalysisCancelledError
+        sc = config.get("state_col"); ts = config.get("target_states")
+        if not sc: QMessageBox.warning(self,"提示","请选择状态列。"); self.process_analysis_panel.set_running(False); return
+        cancel_evt = _ta.Event()
+        def do_work(report_progress=None):
+            if report_progress: report_progress(5,"正在识别列与计算统计量...")
+            return build_analysis_report(df,state_col=sc,feature_cols=fc,target_states=ts,min_samples=30,progress_callback=report_progress)
         def on_success(rep):
             self.process_analysis_panel.set_running(False)
             if rep is None: self.log("工艺分析返回空结果。", level="warning"); return
-            self.process_analysis_panel.set_result(rep)
+            self.process_analysis_panel.set_result(rep, mode="state_classify")
             if "error" in rep: self.log(f"工艺分析失败：{rep['error']}", level="warning"); QMessageBox.warning(self,"分析失败",rep["error"]); return
             self.tabs.setCurrentWidget(self.process_analysis_panel)
             meta=rep.get("meta",{}); self.log(f"工艺分析完成：{meta.get('n_rows',0)} 行，特征 {len(meta.get('feature_cols',[]))} 列，目标状态 {meta.get('target_states',[])}。")
-        def on_error(msg,tb): self.process_analysis_panel.set_running(False); QMessageBox.critical(self,"工艺分析失败",msg); self.log(f"工艺分析失败：{msg}\n{tb}", level="error")
-        self.process_analysis_panel.set_running(True)
-        self._run_background("正在进行工艺分析...", do_work, (), on_success, on_error)
-
-    def _on_ai_insight_requested(self, provider, base_url, model, api_key):
-        report = self.process_analysis_panel.report()
-        if not report or "error" in report: self.process_analysis_panel.set_ai_status("请先完成工艺分析。"); return
-        url=(base_url or "").strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            self.process_analysis_panel.set_ai_status("Base URL 需以 http:// 或 https:// 开头")
-            self.process_analysis_panel.ai_generate_btn.setEnabled(True); self.process_analysis_panel.ai_regenerate_btn.setEnabled(True)
-            self.statusBar().showMessage("Base URL 需以 http:// 或 https:// 开头",5000); self.log("AI 解读已取消：Base URL 需以 http:// 或 https:// 开头", level="error"); return
-        try: messages = build_insight_prompt(report)
-        except Exception as exc: self.process_analysis_panel.set_ai_status(f"失败: 构造 prompt 出错 {exc}"); self.process_analysis_panel.ai_result_browser.setPlainText(""); return
-        self.log(f"AI 解读请求中 provider={provider} model={model}")
-        def do_work(rp=None):
-            client = AIClient(provider=provider, base_url=url, api_key=api_key, model=model)
-            return client.chat(messages, temperature=0.3)
-        def on_success(text):
-            self.process_analysis_panel.set_ai_result(text); self.log(f"AI 解读完成，返回 {len(text or '')} 字。")
         def on_error(msg,tb):
-            sm = str(msg).replace(api_key,"***") if api_key else str(msg)
-            self.process_analysis_panel.set_ai_status(f"失败: {sm}"); self.process_analysis_panel.ai_result_browser.setPlainText("")
-            self.process_analysis_panel.ai_generate_btn.setEnabled(True); self.process_analysis_panel.ai_regenerate_btn.setEnabled(True)
-            self.log(f"AI 解读失败：{sm}", level="error")
-        self._run_background("AI 解读请求中...", do_work, (), on_success, on_error)
+            self.process_analysis_panel.set_running(False)
+            if "已取消" in str(msg):
+                self.log("工艺分析已被用户取消。", level="info")
+            else:
+                QMessageBox.critical(self,"工艺分析失败",msg)
+                self.log(f"工艺分析失败：{msg}\n{tb}", level="error")
+        self.process_analysis_panel.set_running(True)
+        self._run_background("正在进行工艺分析...", do_work, (), on_success, on_error, busy_lock="analysis", cancel_event=cancel_evt)
+
+    def _on_ai_insight_requested(self, provider, base_url, model, api_key, timeout_sec):
+        import threading as _threading
+        from app.services.ai_client import AICancelledError
+        panel = self.process_analysis_panel
+        report = panel.report()
+        mode = panel.current_mode()
+        if not report or "error" in report:
+            panel.set_ai_status("请先完成工艺分析。")
+            panel.set_ai_finished()
+            return
+        url = (base_url or "").strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            panel.set_ai_status("Base URL 需以 http:// 或 https:// 开头")
+            self.statusBar().showMessage("Base URL 需以 http:// 或 https:// 开头", 5000)
+            self.log("AI 解读已取消：Base URL 需以 http:// 或 https:// 开头", level="error")
+            panel.set_ai_finished()
+            return
+        try:
+            if mode == "head_tail_attr":
+                messages = build_head_tail_prompt(report)
+            else:
+                messages = build_insight_prompt(report)
+        except Exception as exc:
+            panel.set_ai_status(f"失败: 构造 prompt 出错 {exc}")
+            panel.ai_result_browser.setPlainText("")
+            panel.set_ai_finished()
+            return
+        self.log(f"AI 解读请求中 provider={provider} model={model}")
+        cancel_event = _threading.Event()
+        # 记录当前请求标识，用于丢弃过期结果
+        req_id = id(cancel_event)
+        self._ai_cancel_event = cancel_event
+        panel.set_ai_cancel_callback(lambda: cancel_event.set())
+
+        try:
+            _timeout_sec = int(timeout_sec)
+        except Exception:
+            _timeout_sec = 30
+        if _timeout_sec < 5 or _timeout_sec > 300:
+            _timeout_sec = 30
+
+        def do_work():
+            client = AIClient(provider=provider, base_url=url, api_key=api_key, model=model, timeout=float(_timeout_sec))
+            return client.chat(messages, temperature=0.3, cancel_event=cancel_event)
+
+        def on_success(text):
+            # 如果用户在这期间已经触发了新请求或停止，丢弃结果但必须恢复按钮
+            if getattr(self, "_ai_cancel_event", None) is not cancel_event:
+                self.log("AI 结果已丢弃（存在更新的请求/停止）。", level="info")
+                panel.set_ai_finished()
+                return
+            if cancel_event.is_set():
+                panel.set_ai_status("已取消。")
+                self.log("AI 解读已被用户取消。", level="info")
+                panel.set_ai_finished()
+                return
+            panel.set_ai_result(text)
+            self.log(f"AI 解读完成，返回 {len(text or '')} 字。")
+            self.statusBar().showMessage("AI 解读完成", 5000)
+
+        def on_error(msg, tb):
+            if getattr(self, "_ai_cancel_event", None) is not cancel_event:
+                panel.set_ai_finished()
+                return
+            sm = str(msg).replace(api_key, "***") if api_key else str(msg)
+            panel.ai_result_browser.setPlainText("")
+            if isinstance(msg, AICancelledError) or (isinstance(msg, Exception) and isinstance(msg, AICancelledError)):
+                panel.set_ai_status("已取消。")
+                self.log("AI 解读已被用户取消。", level="info")
+            elif "用户已取消" in sm:
+                panel.set_ai_status("已取消。")
+                self.log("AI 解读已被用户取消。", level="info")
+            else:
+                panel.set_ai_status(f"失败: {sm}")
+                self.log(f"AI 解读失败：{sm}", level="error")
+            panel.set_ai_finished()
+
+        # 注意：on_error 接收 Worker 传来的 msg 是 str(Exception)，因此 isinstance 检查失效；上面用"用户已取消"子串兜底。
+        # W12.3: 额外通过 finished 信号兜底，确保无论成功/失败/异常 set_ai_finished 一定会被调用一次
+        self._run_background(
+            "AI 解读请求中...", do_work, (), on_success, on_error,
+            busy_lock="none",
+            on_finished=lambda: panel.set_ai_finished(),
+        )
 
     def _on_process_analysis_export(self):
         report = self.process_analysis_panel.report()
+        mode = self.process_analysis_panel.current_mode()
         if not report or "error" in report: QMessageBox.warning(self,"提示","没有可导出的分析结果，请先执行分析。"); return
         start_dir = str(Path(self._last_export_dir)/"process_window")
-        csv_path,_ = QFileDialog.getSaveFileName(self,"导出工艺窗口 CSV", start_dir+".csv","CSV 文件 (*.csv)")
+        csv_path,_ = QFileDialog.getSaveFileName(self,"导出分析结果 CSV", start_dir+".csv","CSV 文件 (*.csv)")
         if not csv_path: return
-        rows=[]
-        for st,body in report.get("univariate",{}).items():
-            for ft,info in (body.get("features",{}) if isinstance(body,dict) else {}).items():
-                w1=info.get("window_1sigma",(None,None)); w2=info.get("window_2sigma",(None,None))
-                rows.append({"状态":st,"特征":ft,"样本数":info.get("count",0),"均值":info.get("mean"),"标准差":info.get("std"),"μ±σ_下界":w1[0],"μ±σ_上界":w1[1],"μ±2σ_下界":w2[0],"μ±2σ_上界":w2[1],"P5":info.get("p5"),"P95":info.get("p95")})
-        odf = pd.DataFrame(rows)
-        try: odf.to_csv(csv_path,index=False,encoding="utf-8-sig")
-        except Exception as exc: QMessageBox.critical(self,"导出失败",f"CSV 写入失败：{exc}"); self.log(f"工艺分析 CSV 导出失败：{exc}", level="error"); return
-        self._last_export_dir = str(Path(csv_path).parent); self._settings.setValue("last_export_dir", self._last_export_dir); self.log(f"工艺窗口 CSV 已导出：{csv_path}")
+        try:
+            if mode == "head_tail_attr":
+                self._export_head_tail_csv(report, csv_path)
+            else:
+                self._export_state_classify_csv(report, csv_path)
+            self._last_export_dir = str(Path(csv_path).parent); self._settings.setValue("last_export_dir", self._last_export_dir)
+            self.log(f"分析结果 CSV 已导出：{csv_path}")
+        except Exception as exc:
+            QMessageBox.critical(self,"导出失败",f"CSV 写入失败：{exc}"); self.log(f"分析 CSV 导出失败：{exc}", level="error"); return
+
+        if mode == "head_tail_attr":
+            return  # 新模式 V1 不导出箱线图
         dpng = str(Path(csv_path).with_suffix(".png"))
         png_path,_ = QFileDialog.getSaveFileName(self,"导出箱线图 PNG", dpng,"PNG 图片 (*.png)")
         if not png_path: return
         try: export_plot_widget_to_png(self.process_analysis_panel.boxplot_widget, png_path)
         except ExportError as exc: QMessageBox.critical(self,"导出失败",str(exc)); self.log(f"工艺分析 PNG 导出失败：{exc}", level="error"); return
         self.log(f"工艺箱线图 PNG 已导出：{png_path}")
+
+    def _export_state_classify_csv(self, report, csv_path: str) -> None:
+        import pandas as pd
+        rows=[]
+        for st,body in report.get("univariate",{}).items():
+            for ft,info in (body.get("features",{}) if isinstance(body,dict) else {}).items():
+                w1=info.get("window_1sigma",(None,None)); w2=info.get("window_2sigma",(None,None))
+                rows.append({"状态":st,"特征":ft,"样本数":info.get("count",0),"均值":info.get("mean"),"标准差":info.get("std"),"μ±σ_下界":w1[0],"μ±σ_上界":w1[1],"μ±2σ_下界":w2[0],"μ±2σ_上界":w2[1],"P5":info.get("p5"),"P95":info.get("p95")})
+        pd.DataFrame(rows).to_csv(csv_path,index=False,encoding="utf-8-sig")
+
+    def _export_head_tail_csv(self, report, csv_path: str) -> None:
+        import pandas as pd
+        rows=[]
+        for a in report.get("attribution", []) or []:
+            wi = a.get("window_ideal") or (None, None)
+            wo = a.get("window_off") or (None, None)
+            rows.append({
+                "特征": a.get("feature"),
+                "N": a.get("n"),
+                "Pearson_r": a.get("pearson_r"),
+                "Spearman_r": a.get("spearman_r"),
+                "方向": a.get("direction"),
+                "理想时均值": a.get("mean_when_ideal"),
+                "理想时标准差": a.get("std_when_ideal"),
+                "理想窗口下界": wi[0],
+                "理想窗口上界": wi[1],
+                "偏离时均值": a.get("mean_when_off"),
+                "偏离时标准差": a.get("std_when_off"),
+                "偏离窗口下界": wo[0],
+                "偏离窗口上界": wo[1],
+            })
+        pd.DataFrame(rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
 
 
     def _export_stats(self):
@@ -1050,6 +1259,13 @@ class MainWindow(QMainWindow):
         self._invalidate_cache(); self._apply_initial_state()
         self.processing_panel._clear_rules()
         self.process_analysis_panel.set_dataset(None,[],[],[],[])
+        # W12.1: 重置 AI 软取消状态
+        try:
+            if self._ai_cancel_event is not None:
+                self._ai_cancel_event.set()
+        except Exception:
+            pass
+        self._ai_cancel_event = None
         self.log("已清空全部数据与临时储存区。"); self.statusBar().showMessage("已清空")
 
     def _show_about(self):
@@ -1062,21 +1278,74 @@ class MainWindow(QMainWindow):
                "      timeout=60s；错误信息细分；idle 显示 endpoint/model；错误不泄露 Key。")
         QMessageBox.information(self, t, txt)
 
-    def _run_background(self, label, fn, fn_args, on_success, on_error=None):
-        if self._busy: QMessageBox.information(self,"请稍候","有任务正在执行，请等待完成后再试。"); return
-        self._set_busy(True, label); worker = Worker(fn, *fn_args)
+    def _run_background(self, label, fn, fn_args, on_success, on_error=None, busy_lock="dataset", on_started=None, on_finished=None, cancel_event=None):
+        """Run fn in a thread pool Worker.
+
+        busy_lock:
+          - 'dataset': 占 dataset 锁，修改数据的操作互斥
+          - 'analysis': 占 analysis 锁，分析/绘图/描述统计互斥
+          - 'none':    不占锁，不弹全局 QProgressDialog（AI 请求走此模式）。
+        dataset 和 analysis 之间互不阻塞；同一时刻只弹一个全局 QProgressDialog。
+        on_finished: 可选回调，在成功/失败后都会被调用一次（Worker.finished 信号触发）。
+        """
+        if busy_lock == "dataset":
+            if self._dataset_busy:
+                QMessageBox.information(self, "请稍候", "数据任务正在执行中，请等待完成后再试。")
+                return
+        elif busy_lock == "analysis":
+            if self._analysis_busy:
+                self.statusBar().showMessage("有分析任务正在执行，请稍候再试。", 3000)
+                self.log("已有分析任务在执行，本次请求已忽略（请稍候再试）。", level="warning")
+                return
+        elif busy_lock == "none":
+            pass
+        else:
+            raise ValueError(f"unknown busy_lock: {busy_lock}")
+        if busy_lock in ("dataset", "analysis"):
+            self._set_busy(busy_lock, True, label, cancel_event=cancel_event)
+        worker = Worker(fn, *fn_args)
+
         def _on_result(result):
-            self._set_busy(False)
-            try: on_success(result)
-            except Exception as exc: self.log(f"UI刷新异常：{exc}", level="error"); self.app_logger.error("UI刷新异常", exc=exc); QMessageBox.critical(self,"错误",str(exc))
+            if busy_lock in ("dataset", "analysis"):
+                self._set_busy(busy_lock, False)
+            try:
+                on_success(result)
+            except Exception as exc:
+                self.log(f"UI刷新异常：{exc}", level="error")
+                self.app_logger.error("UI刷新异常", exc=exc)
+                QMessageBox.critical(self, "错误", str(exc))
+
         def _on_error(msg, tb):
-            self._set_busy(False)
+            if busy_lock in ("dataset", "analysis"):
+                self._set_busy(busy_lock, False)
             if on_error is not None:
-                try: on_error(msg,tb)
-                except Exception as exc: self.log(f"错误回调异常：{exc}", level="error")
-            else: QMessageBox.critical(self,"操作失败",msg); self.log(f"{msg}\n{tb}", level="error")
-        def _on_started(): self.statusBar().showMessage(label)
-        worker.signals.started.connect(_on_started); worker.signals.result.connect(_on_result); worker.signals.error.connect(_on_error); worker.signals.progress.connect(self._progress_cb)
+                try:
+                    on_error(msg, tb)
+                except Exception as exc:
+                    self.log(f"错误回调异常：{exc}", level="error")
+            else:
+                QMessageBox.critical(self, "操作失败", msg)
+                self.log(f"{msg}\n{tb}", level="error")
+
+        def _on_started():
+            self.statusBar().showMessage(label)
+            if on_started is not None:
+                try:
+                    on_started()
+                except Exception:
+                    pass
+
+        worker.signals.started.connect(_on_started)
+        worker.signals.result.connect(_on_result)
+        worker.signals.error.connect(_on_error)
+        worker.signals.progress.connect(self._progress_cb)
+        if on_finished is not None:
+            def _on_finished():
+                try:
+                    on_finished()
+                except Exception as exc:
+                    self.log(f"finished 回调异常：{exc}", level="error")
+            worker.signals.finished.connect(_on_finished)
         self._threadpool.start(worker)
 
     def _install_excepthook(self):

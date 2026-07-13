@@ -7,3 +7,6 @@ __pycache__/
 
 *.md.bak
 _w.txt
+
+# UI 冒烟测试产物
+tests/ui_smoke_out/

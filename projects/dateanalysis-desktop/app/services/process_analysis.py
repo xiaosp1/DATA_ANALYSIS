@@ -5,11 +5,17 @@
 """
 from __future__ import annotations
 
+import threading
 import warnings
 from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+
+
+class AnalysisCancelledError(Exception):
+    """用户取消分析时抛出。"""
+    pass
 
 
 # ---------- 工具 ----------
@@ -191,8 +197,16 @@ def compute_univariate_windows(
     state_col: str,
     target_states: Iterable[Any] | None = None,
     min_samples: int = 30,
+    progress_callback=None,
+    pct_range: tuple[float, float] = (0.0, 100.0),
+    cancel_event=None,
 ) -> dict[Any, dict[str, dict[str, Any]]]:
-    """对每个 state × feature 计算统计量 + μ±σ / μ±2σ 窗口。"""
+    """对每个 state × feature 计算统计量 + μ±σ / μ±2σ 窗口。
+
+    progress_callback: 可选 ``(pct:int, msg:str) -> None``
+    pct_range: 本函数在整体进度中的百分比区间（默认 0-100）
+    cancel_event: 可选 ``threading.Event``，set 时抛出 AnalysisCancelledError
+    """
     feature_cols = [str(c) for c in feature_cols if c in df.columns]
     if state_col not in df.columns:
         raise KeyError(f"状态列不存在：{state_col}")
@@ -202,13 +216,39 @@ def compute_univariate_windows(
     else:
         states = list(target_states)
 
+    n_states = max(1, len(states))
+    n_feats = max(1, len(feature_cols))
+    total_steps = n_states * n_feats
+    step_idx = 0
+    last_pct = -1
+
+    def _rp(step: int, msg: str) -> None:
+        if progress_callback is None:
+            return
+        ratio = step / max(1, total_steps)
+        pct = int(pct_range[0] + (pct_range[1] - pct_range[0]) * ratio)
+        # 每 5% 或状态切换时回传一次（避免回调风暴）
+        nonlocal last_pct
+        if pct - last_pct >= 5 or step == total_steps:
+            last_pct = pct
+            try:
+                progress_callback(pct, msg)
+            except Exception:
+                pass
+
+    def _check_cancel() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AnalysisCancelledError("单变量窗口计算已被用户取消")
+
     out: dict[Any, dict[str, dict[str, Any]]] = {}
-    for state in states:
+    for si, state in enumerate(states):
+        _check_cancel()
         sub = df[df[state_col] == state]
         n_total = int(len(sub))
         per_feat: dict[str, dict[str, Any]] = {}
         unreliable = n_total < min_samples
-        for feat in feature_cols:
+        for fi, feat in enumerate(feature_cols):
+            _check_cancel()
             series = pd.to_numeric(sub[feat], errors="coerce").dropna()
             n = int(len(series))
             if n == 0:
@@ -219,6 +259,8 @@ def compute_univariate_windows(
                     "window_1sigma": (None, None),
                     "window_2sigma": (None, None),
                 }
+                step_idx += 1
+                _rp(step_idx, f"单变量窗口：状态 {state}/{len(states)} 特征 {feat}")
                 continue
             mean = float(series.mean())
             std = float(series.std(ddof=1)) if n > 1 else 0.0
@@ -241,6 +283,8 @@ def compute_univariate_windows(
                 "window_1sigma": (mean - std, mean + std),
                 "window_2sigma": (mean - 2 * std, mean + 2 * std),
             }
+            step_idx += 1
+            _rp(step_idx, f"单变量窗口：状态 {si + 1}/{n_states} 特征 {feat}")
         out[state] = {
             "count": n_total,
             "unreliable": bool(unreliable),
@@ -299,6 +343,7 @@ def fit_greedy_tree(
     max_depth: int = 3,
     min_samples_leaf: int = 30,
     max_rules: int = 8,
+    cancel_event=None,
 ) -> list[dict[str, Any]]:
     """对二分类（target_state vs 其他）递归贪心分裂，返回叶节点规则列表。"""
     feature_cols = [str(c) for c in feature_cols if c in df.columns]
@@ -322,6 +367,8 @@ def fit_greedy_tree(
     def recurse(
         idx: np.ndarray, depth: int, conditions: list[dict[str, Any]]
     ) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AnalysisCancelledError("规则挖掘已被用户取消")
         n = len(idx)
         if n == 0:
             return
@@ -385,6 +432,7 @@ def compute_feature_importance(
     feature_cols: Iterable[str],
     state_col: str,
     min_group_samples: int = 2,
+    cancel_event=None,
 ) -> list[tuple[str, float]]:
     """one-way ANOVA F 值简化实现：F = (SSB/(k-1)) / (SSW/(n-k))。
 
@@ -396,6 +444,8 @@ def compute_feature_importance(
     groups_raw = df[state_col]
     out: list[tuple[str, float]] = []
     for feat in feature_cols:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AnalysisCancelledError("特征重要性计算已被用户取消")
         s = pd.to_numeric(df[feat], errors="coerce")
         data = pd.DataFrame({"g": groups_raw, "v": s}).dropna()
         if data.empty:
@@ -443,8 +493,23 @@ def build_analysis_report(
     min_samples: int = 30,
     max_tree_depth: int = 3,
     min_samples_leaf: int = 30,
+    progress_callback=None,
+    cancel_event=None,
 ) -> dict[str, Any]:
-    """分析总入口。任何识别失败时返回带 ``error`` 字段的 dict 而不是抛异常。"""
+    """分析总入口。任何识别失败时返回带 ``error`` 字段的 dict 而不是抛异常。
+
+    progress_callback: 可选 ``(pct:int, msg:str) -> None``，粗粒度上报：
+        10=推断列完成；40=单变量窗口完成；75=规则完成；95=特征重要性完成。
+    cancel_event: 可选 ``threading.Event``，set 时抛出 AnalysisCancelledError 提前终止。
+    """
+    def _rp(p: int, m: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(int(p), str(m))
+        except Exception:
+            pass
+
     warnings_list: list[str] = []
     try:
         if df is None or len(df) == 0:
@@ -489,6 +554,8 @@ def build_analysis_report(
             target_states_list = [v for v in target_states if v in state_values_present or _in_state_series(state_series, v)]
         target_states_list = _unique_preserve(target_states_list)
 
+        _rp(10, "识别列与基础统计完成")
+
         n_total = int(len(df))
         summary: dict[Any, dict[str, Any]] = {}
         for sv in state_values_present:
@@ -504,14 +571,22 @@ def build_analysis_report(
                 )
 
         # univariate
+        if cancel_event is not None and cancel_event.is_set():
+            raise AnalysisCancelledError("分析已被用户取消（单变量阶段前）")
         univariate = compute_univariate_windows(
             df, feature_cols, state_col,
             target_states=target_states_list, min_samples=min_samples,
+            progress_callback=progress_callback,
+            pct_range=(10, 40),
+            cancel_event=cancel_event,
         )
+        _rp(40, "单变量工艺窗口完成")
 
         # rules：每个目标状态分别拟合
         rules: dict[Any, list[dict[str, Any]]] = {}
-        for sv in target_states_list:
+        for i, sv in enumerate(target_states_list):
+            if cancel_event is not None and cancel_event.is_set():
+                raise AnalysisCancelledError("分析已被用户取消（规则挖掘阶段）")
             cnt = summary.get(sv, {}).get("count", 0)
             if cnt < min_samples_leaf:
                 rules[sv] = []
@@ -520,10 +595,19 @@ def build_analysis_report(
             rules[sv] = fit_greedy_tree(
                 df, feature_cols, state_col, target_state=sv,
                 max_depth=max_tree_depth, min_samples_leaf=min_samples_leaf,
+                cancel_event=cancel_event,
             )
+            # 规则挖掘阶段进度：每完成一个状态回传一次（40→75区间）
+            if progress_callback is not None and target_states_list:
+                ratio = (i + 1) / len(target_states_list)
+                _rp(int(40 + 35 * ratio), f"规则挖掘：{i + 1}/{len(target_states_list)}")
+        _rp(75, "规则挖掘完成")
 
         # feature importance
+        if cancel_event is not None and cancel_event.is_set():
+            raise AnalysisCancelledError("分析已被用户取消（特征重要性阶段前）")
         importance = compute_feature_importance(df, feature_cols, state_col)
+        _rp(95, "特征重要性计算完成")
 
         # 把所有 state key 转成字符串，便于 JSON 序列化（UI 里再转也可）
         summary_s = {_key_to_str(k): v for k, v in summary.items()}

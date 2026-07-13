@@ -1,33 +1,51 @@
 # TODO — 数据分析 PM
 
-> 最后更新：2026-07-11 16:40
+> 最后更新：2026-07-13 16:41
 
 ## 🔥 P0 阻塞
 - 无
 
 ## 🚧 进行中
-- 等 Owner 试用 V1.11.0 W11：双击 bat 后，AI解读Tab应默认显示endpoint为内网代理、模型gpt-5.5，点「生成解读」应当连通返回结果（真连通性需桌面验证）
+- 等Owner桌面验证 V1.12.6（W12全系列）：
+  1. 关掉旧软件，双击 `启动 DateAnalysis.bat` 重启
+  2. 机尾指数-s归因模式
+  3. 工艺分析能出结果+进度条走动+取消按钮可终止
+  4. API Key 配置弹窗不报错（密码模式）
+  5. AI期间不锁全局+可停止+超时可配置
+  6. 超时/停止后按钮恢复
+  7. 配完Key按钮亮+状态栏反馈
+  8. ai_config.json 可用（openai/deepseek各一套）
 
-## 📋 Backlog（V1.12+ 候选）
-- [ ] P2: AI 解读"自由问答入口"（W12 已立项但未完成：两次子代理执行失败，按 Owner 指令暂不死磕，后续做极简单轮版）
-- [ ] P2: tooltip 加上「均值: xxx」（鼠标离均值线近时）
-- [ ] P2: 数据处理动作扩展（替换中位数/0/固定值、排序、筛选、去重）
+## 📋 Backlog（V1.13 候选）
+- [ ] P1: 描述统计KDE移后台/降采样（BUG-2）
+- [ ] P1: merge_by_category / merge_cross_category 走后台线程（BUG-5）
+- [ ] P1: 折线图选项变更加300ms debounce（RISK-3）
+- [ ] P1: dataset/analysis级QProgressDialog加取消按钮（RISK-7）
+- [ ] P2: AI 真·硬中断（QNetworkAccessManager 或 requests+streaming）
+- [ ] P2: AI 解读"自由问答入口"
+- [ ] P2: tooltip 加「均值: xxx」
+- [ ] P2: 数据处理动作扩展
 - [ ] P2: 均值线按序列单独控制
 - [ ] P2: 大文件表格虚拟滚动/分页
-- [ ] P2: `.xls` 完整兼容验证
-- [ ] P2: 工具栏按钮在窄屏下的下拉收纳
-- [ ] P2: 重缩放"复原数值"精度问题（float32 回退，需保留原始副本）
-- [ ] P2: 双 Y 轴模式右轴均值标签 TextItem
-- [ ] P2: 两数据集对齐（align_by_time 已有 API，需 UI 入口）
+- [ ] P2: 工具栏按钮在窄屏下拉收纳
+- [ ] P2: 重缩放"复原数值"精度
+- [ ] P2: 双Y轴右轴均值标签
+- [ ] P2: 两数据集对齐UI入口
+- [ ] P2: 工艺分析导出截图移后台
+- [ ] P2: TablePanel列宽自动调整卡顿
+- [ ] P2: 清理死代码
+- [ ] P2: excepthook弹友好提示
 - [ ] P3: 更多图表类型
-- [ ] P3: 时序监控 Phase 2（SPC/EWMA/Cpk/ACF）
-- [ ] P3: GitHub 上传（待 Owner 提供账户/仓库名/可见性）
-- [ ] P3: scripts/pm_meta_write.py 在 PowerShell 下 --stdin 管道 bug 修复（ADR-017 工具链跟进）
+- [ ] P3: 时序监控 Phase 2
+- [ ] P3: GitHub上传
+- [ ] P3: scripts/pm_meta_write.py PowerShell --stdin bug
 
 ## ✅ 最近完成
-- [x] W11 V1.11.0: AI解读超时根因修复——自动读 ~/.codex/config.toml + 环境变量拿内网代理 base_url/gpt-5.5；AIClient timeout=60s+友好错误；idle状态显示当前endpoint；on_error不泄露key（2026-07-11 15:05，108 passed 6.41s 0 warnings；ai_config 实测读到 http://10.135.136.21:8317/v1 + gpt-5.5）
-- [x] W10 V1.10.1: 右Dock最小宽度400+AI工具栏3行布局+节点悬停tooltip（单图容差18px+小多图补齐）（2026-07-11 13:55，103 passed）
-- [x] W9 V1.10.0: 三栏可收起（QDockWidget双侧）+AI URL全provider可编辑+持久化（2026-07-11 13:00，98 passed）
-- [x] W8b: AI 解读（OpenAI/DeepSeek/自定义） 2026-07-11 12:15，91 passed
-- [x] W8a: 工艺窗口分析 2026-07-11
-- [x] W7: 小多图+导出修复 2026-07-11 10:20
+- [x] W12.7 V1.12.7: ai_client.py 字面 \n SyntaxError 热修复——8处字面反斜杠+n替换为真实换行，主程序可启动；ast.parse通过 + 125 passed（2026-07-13 16:26）
+- [x] W12.6 V1.12.6: API Key配置弹窗EchoMode修复——QInputDialog.EchoMode → QLineEdit.EchoMode.Password；同步修正 head_tail_attribution 取消测试；125 passed（2026-07-13 13:20）
+- [x] W12.5 V1.12.5: 工艺分析启动无响应修复——_run_background加cancel_event参数并透传_set_busy；do_work参数名改report_progress匹配Worker内省；125 passed（2026-07-13 12:50）
+- [x] W12.4 V1.12.4: 工艺分析进度细化+取消按钮——compute_univariate_windows加progress_callback/cancel_event；每20%特征回传进度；QProgressDialog取消按钮；cancel_event提前终止；125 passed（2026-07-13 11:50）
+- [x] W12.3 V1.12.3: AI按钮3bug修复+ai_config.json——超时/停止后按钮on_finished兜底恢复；配完Key状态栏反馈+按钮刷新；ai_config.json支持openai/deepseek两套base_url/model/api_key；125 passed（2026-07-13 10:30）
+- [x] W12.2 V1.12.2: AI超时可配置（5~300s SpinBox+QSettings持久化+状态栏动态显示）（2026-07-13 09:56）
+- [x] W12.1 V1.12.1: AI锁与超时热修复（双锁拆分+停止按钮+软取消+30s超时）（2026-07-13 09:45）
+- [x] W12 V1.12.0: 机尾指数-s归因模式（方案B）（2026-07-13 08:59）

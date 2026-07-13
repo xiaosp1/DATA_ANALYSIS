@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from app.services.ai_config import load_default_ai_config
+from app.services.ai_config import load_ai_config_file, load_default_ai_config
 
 _PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -46,7 +47,7 @@ _PALETTE = [
 class ProcessAnalysisPanel(QWidget):
     analysis_requested = Signal(dict)
     export_requested = Signal()
-    ai_insight_requested = Signal(str, str, str, str)  # provider, base_url, model, api_key
+    ai_insight_requested = Signal(str, str, str, str, int)  # provider, base_url, model, api_key, timeout_sec
 
     # 轻量 XOR 混淆固定 key（不是强加密，仅防同事随手翻 QSettings 注册表看到明文）
     _OBFUSCATE_KEY = "DateAnalysis-AI-Key-Obf-v1!"
@@ -57,10 +58,15 @@ class ProcessAnalysisPanel(QWidget):
         self._numeric_cols: list[str] = []
         self._datetime_cols: list[str] = []
         self._report: dict[str, Any] | None = None
+        self._mode: str = "state_classify"  # W12: state_classify | head_tail_attr
         self._api_keys: dict[str, str] = {}
+        # W12.3: 标记哪些 provider 的 key 来自 ai_config.json 配置文件（用于状态栏文案）
+        self._api_key_from_config: set[str] = set()
         # W9：每个 provider 记忆用户自定义过的 base_url / model（None 表示尚未手动改过）
         self._user_base_url: dict[str, str] = {}
         self._user_model: dict[str, str] = {}
+        self._ai_cancel_callback = None  # W12.1: fn() -> None
+        self._ai_running = False
         self._settings = QSettings("DateAnalysis", "DateAnalysis")
         self._load_user_ai_settings()
         # W11：从 ~/.codex/config.toml / env 加载默认 base_url/model/api_key
@@ -68,6 +74,16 @@ class ProcessAnalysisPanel(QWidget):
         _def_key = (self._ai_defaults.get("api_key") or "").strip()
         if _def_key:
             self._api_keys["openai"] = _def_key
+        # W12.3：从启动目录 ai_config.json 读取各 provider 默认配置（优先级：QSettings > ai_config.json > _ai_defaults/env > PRESET）
+        self._ai_config_file = self._find_ai_config_file()
+        self._ai_config_from_file: dict[str, dict[str, str]] = {}
+        if self._ai_config_file is not None:
+            self._ai_config_from_file = load_ai_config_file(self._ai_config_file)
+            for provider, info in self._ai_config_from_file.items():
+                k = (info.get("api_key") or "").strip()
+                if k and not self._api_keys.get(provider):
+                    self._api_keys[provider] = k
+                    self._api_key_from_config.add(provider)
         self._build_ui()
 
     # ---------------- UI 构建 ----------------
@@ -80,6 +96,17 @@ class ProcessAnalysisPanel(QWidget):
         params = QGroupBox("分析参数")
         form = QFormLayout(params)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # W12: 分析模式切换
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("状态分类（原工艺窗口）", "state_classify")
+        self.mode_combo.addItem("机尾指数-s归因", "head_tail_attr")
+        form.addRow("分析模式：", self.mode_combo)
+
+        self.mode_hint_label = QLabel("")
+        self.mode_hint_label.setWordWrap(True)
+        self.mode_hint_label.setStyleSheet("color:#1565c0; padding:2px 4px;")
+        form.addRow("", self.mode_hint_label)
 
         self.state_combo = QComboBox()
         form.addRow("状态列：", self.state_combo)
@@ -149,7 +176,27 @@ class ProcessAnalysisPanel(QWidget):
         self.boxplot_widget = pg.GraphicsLayoutWidget()
         self.result_tabs.addTab(self.boxplot_widget, "箱线图")
 
-        # 6. AI 解读
+        # W12: 6. 机尾指数-s 归因视图（表格 + 文字）
+        self.attrib_widget = QWidget()
+        attrib_root = QVBoxLayout(self.attrib_widget)
+        attrib_root.setContentsMargins(4, 4, 4, 4)
+        self.attrib_summary_label = QLabel("")
+        self.attrib_summary_label.setWordWrap(True)
+        attrib_root.addWidget(self.attrib_summary_label)
+        self.attrib_table = QTableWidget(0, 7)
+        self.attrib_table.setHorizontalHeaderLabels(
+            ["特征", "N", "Pearson", "Spearman", "方向", "理想时μ±σ", "推荐窗口"]
+        )
+        self.attrib_table.horizontalHeader().setStretchLastSection(True)
+        self.attrib_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        attrib_root.addWidget(self.attrib_table)
+        self.attrib_rules_text = QPlainTextEdit()
+        self.attrib_rules_text.setReadOnly(True)
+        self.attrib_rules_text.setMaximumHeight(140)
+        attrib_root.addWidget(self.attrib_rules_text)
+        self.result_tabs.addTab(self.attrib_widget, "归因结果")
+
+        # 7. AI 解读
         self._build_ai_tab()
 
         # W10: 各子内容设最小宽度 0，避免表格/文本撑破 Dock
@@ -171,6 +218,7 @@ class ProcessAnalysisPanel(QWidget):
 
         # 信号
         self.state_combo.currentIndexChanged.connect(self._on_state_col_changed)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.analyze_btn.clicked.connect(self._emit_analyze)
         self.export_btn.clicked.connect(self.export_requested.emit)
 
@@ -201,12 +249,33 @@ class ProcessAnalysisPanel(QWidget):
         self.ai_base_url_edit.setMinimumWidth(0)
         self.ai_base_url_edit.setPlaceholderText("Base URL")
 
+        # W12.2: AI 请求超时时间（用户可配置，QSettings 持久化）
+        self.ai_timeout_spin = QSpinBox()
+        self.ai_timeout_spin.setRange(5, 300)
+        self.ai_timeout_spin.setSingleStep(5)
+        self.ai_timeout_spin.setSuffix(" s")
+        self.ai_timeout_spin.setToolTip(
+            "AI 请求最长等待时间（秒），超时后提示失败。网络慢/内网代理可适当调大。"
+        )
+        self.ai_timeout_spin.setMinimumWidth(0)
+        _saved_to = self._settings.value("ai_timeout_sec", 30, type=int)
+        try:
+            _saved_to = int(_saved_to)
+        except Exception:
+            _saved_to = 30
+        if _saved_to < 5 or _saved_to > 300:
+            _saved_to = 30
+        self.ai_timeout_spin.setValue(_saved_to)
+        self.ai_timeout_spin.valueChanged.connect(self._on_ai_timeout_changed)
+
         tool_grid.addWidget(QLabel("提供商："), 0, 0)
         tool_grid.addWidget(self.ai_provider_combo, 0, 1)
         tool_grid.addWidget(QLabel("模型："), 0, 2)
         tool_grid.addWidget(self.ai_model_edit, 0, 3)
         tool_grid.addWidget(QLabel("Base URL："), 1, 0)
         tool_grid.addWidget(self.ai_base_url_edit, 1, 1, 1, 3)
+        tool_grid.addWidget(QLabel("超时(s)："), 2, 0)
+        tool_grid.addWidget(self.ai_timeout_spin, 2, 1)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -216,11 +285,16 @@ class ProcessAnalysisPanel(QWidget):
         self.ai_generate_btn.setMinimumWidth(80)
         self.ai_regenerate_btn = QPushButton("重新生成")
         self.ai_regenerate_btn.setMinimumWidth(80)
+        self.ai_cancel_btn = QPushButton("停止")
+        self.ai_cancel_btn.setMinimumWidth(60)
+        self.ai_cancel_btn.setEnabled(False)
+        self.ai_cancel_btn.setToolTip("停止当前 AI 请求（软取消：UI 立即恢复，后台请求跑到超时后丢弃）")
         self.ai_generate_btn.setEnabled(False)
         self.ai_regenerate_btn.setEnabled(False)
         btn_row.addWidget(self.ai_set_key_btn)
         btn_row.addWidget(self.ai_generate_btn)
         btn_row.addWidget(self.ai_regenerate_btn)
+        btn_row.addWidget(self.ai_cancel_btn)
 
         tool_grid.setColumnStretch(1, 1)
         tool_grid.setColumnStretch(3, 2)
@@ -249,6 +323,7 @@ class ProcessAnalysisPanel(QWidget):
         self.ai_set_key_btn.clicked.connect(self._on_ai_set_key_clicked)
         self.ai_generate_btn.clicked.connect(self._emit_ai_insight)
         self.ai_regenerate_btn.clicked.connect(self._emit_ai_insight)
+        self.ai_cancel_btn.clicked.connect(self._on_ai_cancel_clicked)
         # W9：所有 provider 下均可编辑 base_url / model；输入变化时持久化
         self.ai_base_url_edit.textEdited.connect(self._on_ai_base_url_edited)
         self.ai_model_edit.textEdited.connect(self._on_ai_model_edited)
@@ -270,6 +345,36 @@ class ProcessAnalysisPanel(QWidget):
             if md.strip():
                 self._user_model[provider] = md.strip()
 
+    @staticmethod
+    def _find_ai_config_file() -> str | None:
+        """查找 ai_config.json 的位置。
+
+        优先级：
+          1) 进程启动工作目录（cwd，即 bat 同级，最符合用户预期）
+          2) 应用可执行文件目录（QCoreApplication.applicationDirPath）
+        找到返回绝对路径字符串，找不到返回 None。
+        """
+        from pathlib import Path
+        candidates: list[Path] = []
+        try:
+            candidates.append(Path.cwd() / "ai_config.json")
+        except Exception:
+            pass
+        try:
+            from PySide6.QtCore import QCoreApplication
+            app_dir = QCoreApplication.applicationDirPath()
+            if app_dir:
+                candidates.append(Path(app_dir) / "ai_config.json")
+        except Exception:
+            pass
+        for c in candidates:
+            try:
+                if c.is_file():
+                    return str(c.resolve())
+            except Exception:
+                continue
+        return None
+
     def _on_ai_base_url_edited(self, text: str) -> None:
         provider = self.ai_provider_combo.currentData() or "openai"
         val = (text or "").strip()
@@ -283,6 +388,24 @@ class ProcessAnalysisPanel(QWidget):
         if val:
             self._user_model[provider] = val
             self._settings.setValue(f"ai_model_{provider}", val)
+
+    def _on_ai_timeout_changed(self, v: int) -> None:
+        try:
+            iv = int(v)
+        except Exception:
+            iv = 30
+        if iv < 5 or iv > 300:
+            iv = 30
+        self._settings.setValue("ai_timeout_sec", iv)
+
+    def ai_timeout_sec(self) -> int:
+        try:
+            v = int(self.ai_timeout_spin.value())
+        except Exception:
+            v = 30
+        if v < 5 or v > 300:
+            return 30
+        return v
 
     def _on_ai_provider_changed(self, _idx: int) -> None:
         from app.services.ai_client import AIClient
@@ -338,7 +461,7 @@ class ProcessAnalysisPanel(QWidget):
             self,
             "输入 API Key（仅保存在本机 QSettings）",
             f"请输入 {provider} 的 API Key：",
-            echo=QInputDialog.EchoMode.Password,
+            echo=QLineEdit.EchoMode.Password,
             text="",
         )
         if not ok:
@@ -347,10 +470,16 @@ class ProcessAnalysisPanel(QWidget):
         self.set_api_key(key)
         if key:
             self._save_api_key_to_settings(provider, key)
+            self.set_ai_status(f"API Key 已保存（provider: {provider}）")
         else:
             self._clear_api_key_from_settings(provider)
+            self.set_ai_status("API Key 已清除")
+        self._refresh_ai_button_state()
 
     def _emit_ai_insight(self) -> None:
+        if self._ai_running:
+            self.set_ai_status("已有 AI 请求在执行，请先点『停止』或等其完成。")
+            return
         if self._report is None or "error" in self._report:
             self.set_ai_status("请先完成工艺分析并得到有效结果。")
             return
@@ -365,11 +494,49 @@ class ProcessAnalysisPanel(QWidget):
         if not key:
             self.set_ai_status("请先配置 API Key")
             return
-        self.set_ai_status("请求中...")
-        self.ai_result_browser.setPlainText("AI 分析中，请稍候...")
+        self._ai_running = True
         self.ai_generate_btn.setEnabled(False)
         self.ai_regenerate_btn.setEnabled(False)
-        self.ai_insight_requested.emit(cfg["provider"], cfg["base_url"], cfg["model"], key)
+        self.ai_cancel_btn.setEnabled(True)
+        # W12.2: 请求期间禁用 AI 相关输入，与其他控件一致
+        self.ai_timeout_spin.setEnabled(False)
+        self.ai_provider_combo.setEnabled(False)
+        self.ai_base_url_edit.setEnabled(False)
+        self.ai_model_edit.setEnabled(False)
+        self.ai_set_key_btn.setEnabled(False)
+        self.ai_result_browser.setPlainText("AI 分析中，请稍候...")
+        endpoint = url
+        model = (cfg.get("model") or "").strip()
+        timeout_sec = self.ai_timeout_sec()
+        self.set_ai_status(
+            f"请求中...（endpoint:{endpoint} 模型:{model}，最多等{timeout_sec}s，可点『停止』）"
+        )
+        self.ai_insight_requested.emit(cfg["provider"], cfg["base_url"], cfg["model"], key, timeout_sec)
+
+    def _on_ai_cancel_clicked(self) -> None:
+        cb = self._ai_cancel_callback
+        self.set_ai_status("已请求停止...")
+        self.ai_cancel_btn.setEnabled(False)
+        if callable(cb):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def set_ai_cancel_callback(self, fn) -> None:
+        self._ai_cancel_callback = fn
+
+    def set_ai_finished(self) -> None:
+        """Called by main_window after AI success/error/cancel to restore buttons."""
+        self._ai_running = False
+        self.ai_cancel_btn.setEnabled(False)
+        # W12.2: 恢复输入控件
+        self.ai_timeout_spin.setEnabled(True)
+        self.ai_provider_combo.setEnabled(True)
+        self.ai_base_url_edit.setEnabled(True)
+        self.ai_model_edit.setEnabled(True)
+        self.ai_set_key_btn.setEnabled(True)
+        self._refresh_ai_button_state()
 
     def _refresh_ai_button_state(self) -> None:
         provider = self.ai_provider_combo.currentData() or "openai"
@@ -465,9 +632,7 @@ class ProcessAnalysisPanel(QWidget):
     def set_ai_result(self, text: str) -> None:
         self.ai_result_browser.setPlainText(text or "")
         self.set_ai_status("解读完成")
-        self.ai_generate_btn.setEnabled(True)
-        self.ai_regenerate_btn.setEnabled(True)
-        self._refresh_ai_button_state()
+        self.set_ai_finished()
 
     def _idle_status_text(self) -> str:
         # W11：展示当前 endpoint / model，便于用户确认是否走代理
@@ -478,6 +643,70 @@ class ProcessAnalysisPanel(QWidget):
 
     def set_ai_status(self, msg: str) -> None:
         self.ai_status_label.setText(str(msg) if msg else "就绪")
+
+    # ---------------- 模式切换 ----------------
+    def _on_mode_changed(self, _idx: int) -> None:
+        mode = self.mode_combo.currentData() or "state_classify"
+        self._mode = str(mode)
+        self._apply_mode_ui()
+        # 根据模式刷新特征列
+        self._populate_features(self._datetime_cols)
+        self._refresh_status_by_mode()
+
+    def _apply_mode_ui(self) -> None:
+        is_attr = self._mode == "head_tail_attr"
+        # 状态列/目标状态区在 head_tail 模式下禁用
+        self.state_combo.setEnabled(not is_attr)
+        self.state_list.setEnabled(not is_attr)
+        # 控制是否显示归因 Tab
+        idx_attrib = self.result_tabs.indexOf(self.attrib_widget)
+        idx_box = self.result_tabs.indexOf(self.boxplot_widget)
+        idx_window = self.result_tabs.indexOf(self.window_table)
+        idx_imp = self.result_tabs.indexOf(self.imp_table)
+        idx_summary = self.result_tabs.indexOf(self.summary_table)
+        idx_rules = self.result_tabs.indexOf(self.rules_text)
+        if is_attr:
+            self.mode_hint_label.setText(
+                "将自动跨类合并机头+机尾数据，以[机尾]指数-s=4为理想目标，分析[机头]*特征对其影响。"
+            )
+            # 切到归因 tab
+            for i in (idx_box, idx_window, idx_imp, idx_summary, idx_rules):
+                if i >= 0:
+                    self.result_tabs.setTabEnabled(i, False)
+            if idx_attrib >= 0:
+                self.result_tabs.setTabEnabled(idx_attrib, True)
+        else:
+            self.mode_hint_label.setText("原工艺窗口模式：按选定状态列对特征做单变量窗口与规则挖掘。")
+            for i in (idx_box, idx_window, idx_imp, idx_summary, idx_rules):
+                if i >= 0:
+                    self.result_tabs.setTabEnabled(i, True)
+            if idx_attrib >= 0:
+                self.result_tabs.setTabEnabled(idx_attrib, False)
+
+    def _has_head_tail_columns(self) -> bool:
+        if self._df is None:
+            return False
+        cols = [str(c) for c in self._df.columns]
+        has_head = any(c.startswith("[机头]") for c in cols)
+        has_tail_target = any(c == "[机尾]指数-s" for c in cols)
+        return has_head and has_tail_target
+
+    def _refresh_status_by_mode(self) -> None:
+        if self._mode == "head_tail_attr":
+            if not self._has_head_tail_columns():
+                self.mode_hint_label.setText(
+                    "⚠ 当前数据集未检测到 [机头]*/[机尾]指数-s 列，请先在左侧数据面板点【跨类合同图】合并机头+机尾数据。"
+                )
+                self.mode_hint_label.setStyleSheet("color:#c62828; padding:2px 4px;")
+                self.analyze_btn.setEnabled(False)
+            else:
+                self.mode_hint_label.setText(
+                    "将自动跨类合并机头+机尾数据，以[机尾]指数-s=4为理想目标，分析[机头]*特征对其影响。"
+                )
+                self.mode_hint_label.setStyleSheet("color:#1565c0; padding:2px 4px;")
+                self.analyze_btn.setEnabled(True)
+        else:
+            self.mode_hint_label.setStyleSheet("color:#1565c0; padding:2px 4px;")
 
     # ---------------- wrap helper ----------------
     @staticmethod
@@ -513,26 +742,36 @@ class ProcessAnalysisPanel(QWidget):
 
         # 清空结果
         self._report = None
+        self._ai_running = False
         self._clear_results()
         self.export_btn.setEnabled(False)
+        self._apply_mode_ui()
         if df is None or len(df) == 0:
             self.status_label.setText("当前无数据集。")
         else:
             self.status_label.setText(f"已加载 {len(df)} 行 × {len(df.columns)} 列，请选择参数后点「开始分析」。")
+        self._refresh_status_by_mode()
         self._refresh_ai_button_state()
         # W11：无数据集/新数据集时 AI 状态回到 idle
         if self._report is None:
             self.set_ai_status(self._idle_status_text())
 
     def get_config(self) -> dict[str, Any]:
-        state_col = self.state_combo.currentData()
-        states = [self._parse_state_value(it.text()) for it in self.state_list.selectedItems()]
+        mode = self._mode
         feats = [it.text() for it in self.feature_list.selectedItems()]
-        return {
-            "state_col": state_col,
-            "target_states": states,
-            "feature_cols": feats,
-        }
+        cfg: dict[str, Any] = {"mode": mode, "feature_cols": feats}
+        if mode == "state_classify":
+            state_col = self.state_combo.currentData()
+            states = [self._parse_state_value(it.text()) for it in self.state_list.selectedItems()]
+            cfg["state_col"] = state_col
+            cfg["target_states"] = states
+        else:
+            cfg["target_col"] = "[机尾]指数-s"
+            cfg["ideal_value"] = 4.0
+        return cfg
+
+    def current_mode(self) -> str:
+        return self._mode
 
     def set_running(self, is_running: bool) -> None:
         self.analyze_btn.setEnabled(not is_running)
@@ -543,7 +782,9 @@ class ProcessAnalysisPanel(QWidget):
         else:
             self.analyze_btn.setText("开始分析")
 
-    def set_result(self, report: dict[str, Any]) -> None:
+    def set_result(self, report: dict[str, Any], mode: str | None = None) -> None:
+        if mode is not None:
+            self._mode = mode
         self._report = report
         self._clear_results()
         if not report:
@@ -552,6 +793,14 @@ class ProcessAnalysisPanel(QWidget):
         if "error" in report:
             self.status_label.setText(f"分析失败：{report['error']}")
             return
+        if self._mode == "head_tail_attr" or report.get("meta", {}).get("mode") == "head_tail_attribution":
+            self._fill_head_tail(report)
+        else:
+            self._fill_state_classify(report)
+        self.export_btn.setEnabled(True)
+        self._refresh_ai_button_state()
+
+    def _fill_state_classify(self, report: dict[str, Any]) -> None:
         self._fill_summary(report.get("summary", {}))
         self._fill_windows(report.get("univariate", {}))
         self._fill_rules(report.get("rules", {}))
@@ -564,8 +813,8 @@ class ProcessAnalysisPanel(QWidget):
         else:
             self.status_label.setText("✅ 分析完成。")
             self.status_label.setStyleSheet("color:#2e7d32; padding:4px 6px; background:#e8f5e9; border-radius:4px;")
-        self.export_btn.setEnabled(True)
-        self._refresh_ai_button_state()
+        # 默认跳到摘要 tab
+        self.result_tabs.setCurrentWidget(self.summary_table)
 
     def report(self) -> dict[str, Any] | None:
         return self._report
@@ -602,9 +851,13 @@ class ProcessAnalysisPanel(QWidget):
         exclude = {"未脱模-s"} | time_set
         if state_col:
             exclude.add(str(state_col))
+        is_attr = (self._mode == "head_tail_attr")
         for c in self._numeric_cols:
             if c in exclude:
                 continue
+            if is_attr:
+                if not c.startswith("[机头]"):
+                    continue
             it = QListWidgetItem(str(c))
             self.feature_list.addItem(it)
             # 默认全选
@@ -616,15 +869,23 @@ class ProcessAnalysisPanel(QWidget):
 
     def _emit_analyze(self) -> None:
         cfg = self.get_config()
-        if not cfg["state_col"]:
-            self.status_label.setText("请先选择状态列。")
-            return
-        if not cfg["feature_cols"]:
-            self.status_label.setText("请至少选择一个特征列。")
-            return
-        if not cfg["target_states"]:
-            self.status_label.setText("请至少选择一个目标状态。")
-            return
+        if self._mode == "head_tail_attr":
+            if not self._has_head_tail_columns():
+                self.status_label.setText("请先在左侧数据面板点【跨类合同图】合并机头+机尾数据。")
+                return
+            if not cfg["feature_cols"]:
+                self.status_label.setText("请至少选择一个 [机头]* 特征列。")
+                return
+        else:
+            if not cfg.get("state_col"):
+                self.status_label.setText("请先选择状态列。")
+                return
+            if not cfg["feature_cols"]:
+                self.status_label.setText("请至少选择一个特征列。")
+                return
+            if not cfg.get("target_states"):
+                self.status_label.setText("请至少选择一个目标状态。")
+                return
         self.set_running(True)
         self.analysis_requested.emit(cfg)
 
@@ -634,6 +895,10 @@ class ProcessAnalysisPanel(QWidget):
         self.rules_text.setPlainText("")
         self.imp_table.setRowCount(0)
         self.boxplot_widget.clear()
+        # W12
+        self.attrib_table.setRowCount(0)
+        self.attrib_rules_text.setPlainText("")
+        self.attrib_summary_label.setText("")
 
     # ---- 表格填充 ----
     def _fill_summary(self, summary: dict) -> None:
@@ -706,6 +971,84 @@ class ProcessAnalysisPanel(QWidget):
             else:
                 self._set_cell(self.imp_table, i, 1, f"{float(fval):.3f}")
         self.imp_table.resizeColumnsToContents()
+
+    # ---- W12 机尾指数-s 归因渲染 ----
+    def _fill_head_tail(self, rep: dict[str, Any]) -> None:
+        meta = rep.get("meta", {}) or {}
+        tdist = rep.get("target_dist", {}) or {}
+        attr = list(rep.get("attribution", []) or [])
+        rules = list(rep.get("top_rules", []) or [])
+        win = rep.get("overall_suggested_window", {}) or {}
+
+        n = int(meta.get("n_rows", 0) or 0)
+        tcol = str(meta.get("target_col", "[机尾]指数-s"))
+        pct_ideal = float(tdist.get("pct_ideal", 0.0) or 0.0) * 100
+        pct_near = float(tdist.get("pct_near_ideal", 0.0) or 0.0) * 100
+        mean = tdist.get("mean")
+        parts = [
+            f"目标列 {tcol}，有效配对 N={n}；均值={self._fmt(mean)}，"
+            f"精确=4 占比 {pct_ideal:.1f}%，近理想(|Δ|≤0.5)占比 {pct_near:.1f}%。"
+        ]
+        if win:
+            win_parts = []
+            for f, info in win.items():
+                win_parts.append(f"{f}=[{self._fmt(info.get('lo'))}, {self._fmt(info.get('hi'))}]")
+            parts.append("综合建议窗口：" + "; ".join(win_parts) + "。")
+        warns = meta.get("warnings", []) or []
+        if warns:
+            parts.append("⚠ " + "；".join(list(warns)[:3]))
+        self.attrib_summary_label.setText(" ".join(parts))
+        self.attrib_summary_label.setWordWrap(True)
+
+        self.attrib_table.setRowCount(len(attr))
+        for i, a in enumerate(attr):
+            feat = str(a.get("feature", ""))
+            n_i = int(a.get("n", 0) or 0)
+            pr = a.get("pearson_r")
+            sr = a.get("spearman_r")
+            direction = a.get("direction", "")
+            mi = a.get("mean_when_ideal")
+            si = a.get("std_when_ideal")
+            wi = a.get("window_ideal") or (None, None)
+            ideal_str = (
+                f"{self._fmt(mi)}±{self._fmt(si)}" if mi is not None and si is not None else "-"
+            )
+            win_str = f"[{self._fmt(wi[0])}, {self._fmt(wi[1])}]" if wi[0] is not None else "-"
+            self._set_cell(self.attrib_table, i, 0, feat)
+            self._set_cell(self.attrib_table, i, 1, str(n_i))
+            self._set_cell(self.attrib_table, i, 2, self._fmt(pr))
+            self._set_cell(self.attrib_table, i, 3, self._fmt(sr))
+            self._set_cell(self.attrib_table, i, 4, str(direction))
+            self._set_cell(self.attrib_table, i, 5, ideal_str)
+            self._set_cell(self.attrib_table, i, 6, win_str)
+        self.attrib_table.resizeColumnsToContents()
+
+        lines: list[str] = []
+        lines.append("Top 单特征阈值规则（按近理想率降序）：")
+        if rules:
+            for i, r in enumerate(rules, start=1):
+                feat = str(r.get("feature", ""))
+                op = "≤" if r.get("op") == "<=" else ">"
+                thr = r.get("threshold")
+                n_r = int(r.get("n", 0) or 0)
+                pct = float(r.get("pct_near_ideal", 0.0) or 0.0) * 100
+                tm = r.get("target_mean")
+                lines.append(
+                    f"  {i}) WHEN {feat} {op} {self._fmt(thr)} "
+                    f"THEN 近理想率={pct:.1f}% (N={n_r}, 目标均值={self._fmt(tm)})"
+                )
+        else:
+            lines.append("  （未挖掘到显著规则）")
+        self.attrib_rules_text.setPlainText("\n".join(lines))
+
+        self.result_tabs.setCurrentWidget(self.attrib_widget)
+
+        if warns:
+            self.status_label.setText("⚠ " + "；".join(list(warns)[:5]))
+            self.status_label.setStyleSheet("color:#b26a00; padding:4px 6px; background:#fff8e1; border-radius:4px;")
+        else:
+            self.status_label.setText("✅ 机尾指数-s 归因完成。")
+            self.status_label.setStyleSheet("color:#2e7d32; padding:4px 6px; background:#e8f5e9; border-radius:4px;")
 
     def _fill_boxplots(self, univariate: dict) -> None:
         """用 pyqtgraph 手绘简易箱线图：每个特征一行子图，x 轴是不同 state。"""
