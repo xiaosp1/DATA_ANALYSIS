@@ -16,10 +16,13 @@ HEAD_TAIL_SYSTEM_PROMPT = (
     "指数-s含义：脱模后手套挂的手指数，=4为完美脱模，偏离4（挂多/挂少）都是缺陷。"
     "用中文回答，面向工艺工程师；结论具体可执行，不说空话套话，不编造数据；"
     "总回答控制在 1000 字以内，结构如下："
-    "1) 核心结论（3句话以内，哪些机头参数最影响指数-s，方向是什么）"
-    "2) Top 3 关键机头参数的量化分析（相关系数、理想窗口、偏离影响）"
-    "3) 推荐工艺窗口（综合Top特征给出建议的参数范围）"
-    "4) 风险点与下一步建议（样本不足/相关性弱/数据质量提示）"
+    "1) 核心结论（3句话以内，哪些机头参数最影响指数-s，方向是什么；"
+    "   综合单变量 Top 与多变量 M1 偏相关 + M2 OLS β* 排序）"
+    "2) Top 5 关键机头参数的单变量 + 多变量对比表"
+    "3) 推荐工艺窗口（综合单变量 Top3 与多变量 β* Top3）"
+    "4) 共线性风险（VIF>10 列名 + 剔除建议）"
+    "5) 样本/数据质量提示（样本不足/相关性弱/常数列剔除等）"
+    "6) 下一步可执行建议（数据补充、参数调优、工艺试验方向）"
 )
 
 
@@ -235,13 +238,105 @@ def build_head_tail_prompt(report: dict[str, Any]) -> list[dict[str, str]]:
     if warns:
         lines.append("")
         lines.append("四、数据/计算风险提示：")
+        # 若后续有 multi 段专用 ⚠ VIF 横幅，则跳过此处的 VIF 重复
+        has_multi_vif = bool(report.get("multi")) and any(
+            "VIF" in w for w in (report.get("multi", {}).get("warnings") or [])
+        )
         for w in warns[:10]:
+            if has_multi_vif and "VIF" in w:
+                continue
             lines.append(f"  - {w}")
 
+    # 多变量归因段（M1 偏相关 + M2 OLS β* + VIF）；无 multi 节点则跳过
+    multi_lines = _render_multi_prompt_section(report)
+    if multi_lines:
+        lines.extend(multi_lines)
+
     lines.append("")
-    lines.append("请基于以上聚合统计给出结构化分析（按系统提示的4段式）。")
+    lines.append("请基于以上聚合统计给出结构化分析（按系统提示的6段式）。")
 
     return [
         {"role": "system", "content": HEAD_TAIL_SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(lines)},
     ]
+
+
+def _render_multi_prompt_section(report: dict[str, Any]) -> list[str]:
+    """渲染 report['multi'] → prompt 行（M1 偏相关 + M2 OLS β*/VIF）。
+
+    无 multi 节点或字段缺失时静默跳过，不破坏 W12 单变量模板。
+    """
+    multi = report.get("multi")
+    if not isinstance(multi, dict):
+        return []
+
+    out: list[str] = []
+    partial_rows = list(multi.get("partial_corr") or [])
+    ols = multi.get("ols") if isinstance(multi.get("ols"), dict) else None
+    multi_warnings = [str(w) for w in (multi.get("warnings") or [])]
+
+    # VIF 显眼提示（即使表未渲染也保留）
+    vif_warn_lines = [w for w in multi_warnings if "VIF" in w]
+    if vif_warn_lines:
+        out.append("")
+        out.append("⚠ VIF 警告（共线性，仅警告不自动剔除）：")
+        for w in vif_warn_lines[:5]:
+            out.append(f"  - {w}")
+
+    # M1 偏相关
+    if partial_rows:
+        out.append("")
+        out.append("五、多变量归因——M1 偏相关（控制其它头部列后的净相关）：")
+        out.append("| 特征 | N | single_r | partial_r | 解读 |")
+        out.append("|---|---|---|---|---|")
+        for row in partial_rows[:5]:
+            feat = str(row.get("feature", ""))
+            n = int(row.get("n", 0) or 0)
+            sr = row.get("single_r")
+            pr = row.get("partial_r")
+            note = ""
+            try:
+                if sr is not None and pr is not None:
+                    if abs(float(sr)) > 0.3 and abs(float(pr)) < abs(float(sr)) * 0.5:
+                        note = "单偏相关大幅下降→与其它列共线"
+                    elif abs(float(pr) - float(sr)) < 1e-9:
+                        note = "单偏相关稳定→独立贡献"
+            except Exception:
+                pass
+            out.append(f"| {feat} | {n} | {_fmt_num(sr,3)} | {_fmt_num(pr,3)} | {note} |")
+
+    # M2 OLS β*
+    if ols:
+        coef = list(ols.get("coef_std") or [])
+        coef_sorted = sorted(coef, key=lambda c: float(c.get("abs_beta_std") or 0.0), reverse=True)
+        out.append("")
+        out.append("六、多变量归因——M2 OLS β*（标准化回归系数，绝对值越大贡献越大）：")
+        if coef_sorted:
+            out.append("| 特征 | β* | |β*| | VIF | VIF 警告 |")
+            out.append("|---|---|---|---|---|")
+            for c in coef_sorted[:5]:
+                feat = str(c.get("feature", ""))
+                b = c.get("beta_std")
+                ab = c.get("abs_beta_std")
+                v = c.get("vif")
+                vw = "⚠ VIF>10" if c.get("vif_warn") else ""
+                out.append(f"| {feat} | {_fmt_num(b,3)} | {_fmt_num(ab,3)} | {_fmt_num(v,2)} | {vw} |")
+        out.append(
+            f"模型拟合：R²={_fmt_num(ols.get('r2'),3)}，R²_adj={_fmt_num(ols.get('r2_adj'),3)}，"
+            f"k={ols.get('k')}，N={ols.get('n')}。"
+        )
+        if ols.get("used_ridge"):
+            out.append("（注：X'X 奇异，已自动岭化 λ=1e-4）")
+    elif multi.get("ols_skipped_reason"):
+        out.append("")
+        out.append(f"六、多变量归因——M2 OLS β*：跳过（{multi.get('ols_skipped_reason')}）")
+
+    if multi_warnings:
+        out.append("")
+        out.append("多变量归因阶段风险提示：")
+        for w in multi_warnings[:5]:
+            if "VIF" in w:
+                continue
+            out.append(f"  - {w}")
+
+    return out

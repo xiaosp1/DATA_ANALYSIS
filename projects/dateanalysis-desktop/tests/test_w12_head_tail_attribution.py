@@ -81,8 +81,15 @@ def test_build_head_tail_report_min_samples_filter():
 
 
 def test_build_head_tail_report_no_head_cols():
-    """没有 [机头] 列时应抛 ValueError（GUI 层捕获后提示）。"""
-    df = pd.DataFrame({"时间": pd.date_range("2024-01-01", periods=100, freq="1min"), "v": range(100), "[机尾]指数-s": [4]*100})
+    """C037-B: 原语义“没有 [机头] 列时拋 ValueError”已被 Owner #3 覆盖。
+    新语义:没有任何数值特征列时拖 ValueError(GUI 层捕获后提示)。
+    本例 df 仅有字符串列 + 目标列,无可用 feature,应拖 ValueError。
+    """
+    df = pd.DataFrame({
+        "时间": pd.date_range("2024-01-01", periods=100, freq="1min"),
+        "name": ["x"] * 100,
+        "[机尾]指数-s": [4] * 100,
+    })
     with pytest.raises(ValueError):
         build_head_tail_report(df, target_col="[机尾]指数-s", min_samples=5)
 

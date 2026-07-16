@@ -1,0 +1,7 @@
+{
+  "agent": {
+    "id": "dataanalysis-pm",
+    "name": "数据分析 PM",
+    "defaultModel": "deepseek/deepseek-v4-flash"
+  }
+}

@@ -76,7 +76,7 @@ def wait_idle(w, timeout=60000, step=50):
             if isinstance(tl, QMessageBox) and tl.isVisible():
                 log(f"(auto-close dialog: {tl.windowTitle()} - {tl.text()[:60]})")
                 tl.accept()
-        if not w._busy:
+        if not w._dataset_busy and not w._analysis_busy:
             return True
     return False
 
@@ -204,6 +204,11 @@ def run_single_category_path(w):
     cp.show_mean_check.setChecked(True)
 
     for gran in ["原始", "分钟", "班次"]:
+        # disconnect auto-refresh to avoid double-start / busy-lock conflict
+        try:
+            w.chart_options_panel.granularity_combo.currentIndexChanged.disconnect()
+        except Exception:
+            pass
         sel_text(cop.granularity_combo, gran)
         QTest.qWait(50)
         log(f"plot[{gran}] ...")
@@ -336,6 +341,10 @@ def run_cross_category_path(w):
     log(f"selected Y: {pick_head} + {pick_tail}")
 
     for gran in GRANULARITIES:
+        try:
+            w.chart_options_panel.granularity_combo.currentIndexChanged.disconnect()
+        except Exception:
+            pass
         sel_text(cop.granularity_combo, gran)
         QTest.qWait(30)
         log(f"cross-plot[{gran}] ...")

@@ -327,7 +327,7 @@ class MainWindow(QMainWindow):
                 self._progress = QProgressDialog(label, None, 0, 100, self)
                 self._progress.setWindowTitle("请稍候")
                 self._progress.setWindowModality(Qt.WindowModality.WindowModal)
-                self._progress.setMinimumDuration(300)
+                self._progress.setMinimumDuration(0)  # C034:立即显示,避免前 300ms 视觉空白
                 self._progress.setAutoClose(True)
                 self._progress.setAutoReset(True)
                 if cancel_event is not None:
@@ -364,16 +364,22 @@ class MainWindow(QMainWindow):
             self._progress = None
 
     def _progress_cb(self, pct: int, msg: str = "") -> None:
+        # C034:None 安全 + 异常捕获加 AttributeError(竞态时 _progress 已被 _set_busy(False) 置 None)
         if self._progress is None:
             return
-        self._progress.setValue(max(0, min(100, int(pct))))
-        if msg:
-            try:
+        try:
+            self._progress.setValue(max(0, min(100, int(pct))))
+            if msg:
+                if self._progress is None:  # ★ 二次检查,防止 setValue 期间被置 None
+                    return
                 self._progress.setLabelText(msg)
-            except RuntimeError:
-                self._progress = None
-                return
-            self.statusBar().showMessage(msg)
+                self.statusBar().showMessage(msg)
+            # ★ 同步推给 panel 内嵌进度条(C034)
+            if hasattr(self, "process_analysis_panel") and self.process_analysis_panel is not None:
+                self.process_analysis_panel.set_progress(int(pct), str(msg or ""))
+        except (RuntimeError, AttributeError):
+            self._progress = None
+            return
 
     def _cache_columns_for(self, item) -> dict[str, set]:
         if item is None: return {"numeric": set(), "datetime": set()}
@@ -997,15 +1003,22 @@ class MainWindow(QMainWindow):
         if mode == "head_tail_attr":
             target_col = config.get("target_col", "[机尾]指数-s")
             cols = [str(c) for c in df.columns]
-            if not any(c.startswith("[机头]") for c in cols) or target_col not in cols:
+            # C037-B: 仅检查 target_col 在数据集中;不再硬要求 [机头]* 前缀(归因模式纳入全部数值列)
+            if target_col not in cols:
                 QMessageBox.warning(
                     self,"提示",
-                    "当前数据未检测到 [机头]*/[机尾]指数-s 列，请先在左侧数据面板点【跨类合同图】合并机头+机尾数据。"
+                    f"当前数据未检测到目标列 {target_col}，请先选择存在的数据列或在左侧数据面板点【跨类合同图】合并机头+机尾数据。"
                 )
                 self.process_analysis_panel.set_running(False); return
             import threading as _tb
             from app.services.head_tail_attribution import AttributionCancelledError
             cancel_evt_attr = _tb.Event()
+            # S5-#3 读 panel 透传的多变量参数
+            multi_enabled = bool(config.get("multi", False))
+            multi_top_n = int(config.get("multi_top_n", 10) or 10)
+            multi_compute_partial = bool(config.get("multi_compute_partial", True))
+            multi_compute_ols = bool(config.get("multi_compute_ols", True))
+            use_pingouin = bool(config.get("use_pingouin", False))
             def do_work(report_progress=None):
                 if cancel_evt_attr.is_set():
                     raise AttributionCancelledError("机尾指数-s归因已取消")
@@ -1015,6 +1028,12 @@ class MainWindow(QMainWindow):
                     ideal_value=float(config.get("ideal_value", 4.0) or 4.0),
                     min_samples=30, report_progress=report_progress,
                     cancel_event=cancel_evt_attr,
+                    # S5-#3 透传多变量参数
+                    multi=multi_enabled,
+                    multi_top_n=multi_top_n,
+                    multi_compute_partial=multi_compute_partial,
+                    multi_compute_ols=multi_compute_ols,
+                    use_pingouin=use_pingouin,
                 )
                 if cancel_evt_attr.is_set():
                     raise AttributionCancelledError("机尾指数-s归因已取消")
@@ -1026,6 +1045,10 @@ class MainWindow(QMainWindow):
                 if "error" in rep: self.log(f"机尾指数-s归因失败：{rep['error']}", level="warning"); QMessageBox.warning(self,"分析失败",rep["error"]); return
                 self.tabs.setCurrentWidget(self.process_analysis_panel)
                 meta=rep.get("meta",{}); self.log(f"机尾指数-s归因完成：有效配对 {meta.get('n_rows',0)} 行，机头特征 {meta.get('n_head_features',0)} 列。")
+                if multi_enabled and isinstance(rep, dict) and rep.get("multi"):
+                    pc = rep["multi"].get("partial_corr") or []
+                    ols = rep["multi"].get("ols") or {}
+                    self.log(f"多变量归因完成：M1 偏相关 {len(pc)} 列；M2 OLS k={ols.get('k',0)} R²={ols.get('r2',0):.3f}。")
             def on_error(msg,tb):
                 self.process_analysis_panel.set_running(False)
                 if "已取消" in str(msg):
@@ -1034,6 +1057,13 @@ class MainWindow(QMainWindow):
                     QMessageBox.critical(self,"归因分析失败",msg)
                     self.log(f"归因分析失败：{msg}\n{tb}", level="error")
             self.process_analysis_panel.set_running(True)
+            # S5-#3 把 cancel_evt 接入 panel 的取消按钮
+            try:
+                self.process_analysis_panel.set_analysis_cancel_callback(
+                    lambda: cancel_evt_attr.set()
+                )
+            except Exception:
+                pass
             self._run_background("正在进行机尾指数-s归因分析...", do_work, (), on_success, on_error, busy_lock="analysis", cancel_event=cancel_evt_attr)
             return
 

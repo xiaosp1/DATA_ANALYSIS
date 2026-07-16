@@ -44,6 +44,7 @@ DECL_DISPATCH_WORDS = (
 )
 EPOCH_REL = Path(".precheck") / "last_head.json"
 EPOCH_STALE_MIN = 10
+LAST_ENCODING_SCAN_REL = Path(".precheck") / "last_encoding_scan.json"
 TURN_OUTPUT_WINDOW_SEC = 300  # 5 minutes
 
 PATH_PATTERNS = [
@@ -352,7 +353,7 @@ def _extract_tool_names(text):
     return tools
 
 
-def _load_tools(transcript, last_assistant):
+def _load_tools(transcript, last_assistant_file):
     text_parts = []
     tools = []
     if transcript:
@@ -361,8 +362,8 @@ def _load_tools(transcript, last_assistant):
             raw = _safe_read_text(tp) or ""
             text_parts.append(raw)
             tools.extend(_extract_tool_names(raw))
-    if last_assistant:
-        ap = Path(last_assistant)
+    if last_assistant_file:
+        ap = Path(last_assistant_file)
         if ap.exists():
             raw = _safe_read_text(ap) or ""
             text_parts.append(raw)
@@ -431,7 +432,7 @@ def _last_spawn_info(workers_path, now):
     return sid, ts
 
 
-def check_need_poll(root, transcript, last_assistant, workers_path, now, rep):
+def check_need_poll(root, transcript, last_assistant_file, workers_path, now, rep):
     cm = root / "COMMITMENTS.md"
     rows = parse_commitments(cm) if cm.exists() else []
     sid, spawn_ts = _last_spawn_info(workers_path, now)
@@ -461,18 +462,18 @@ def check_need_poll(root, transcript, last_assistant, workers_path, now, rep):
                 "session " + str(sid) + " within poll window (" + str(int(age)) + "s)")
 
 
-def check_fake_done(transcript, last_assistant, rep, mode="head",
+def check_fake_done(transcript, last_assistant_file, rep, mode="head",
                     turn_has_output=False):
     have_text = False
     if transcript and Path(transcript).exists():
         have_text = True
-    if last_assistant and Path(last_assistant).exists():
+    if last_assistant_file and Path(last_assistant_file).exists():
         have_text = True
     if not have_text:
         if mode == "head":
             rep.add("OK", "FAKE_DONE", "no last assistant/transcript text provided")
         return
-    text, tools = _load_tools(transcript, last_assistant)
+    text, tools = _load_tools(transcript, last_assistant_file)
     if not text:
         if mode == "head":
             rep.add("OK", "FAKE_DONE", "no last assistant text provided")
@@ -684,31 +685,105 @@ def check_turn_gate(root, now, artifacts, rep):
     return has_output
 
 
+def _check_inline_python_violation(turn_artifacts_path, rep):
+    """T003: Detect 'python -c "..."' long inline commands that trigger
+    PowerShell escaping bugs.  FAIL if found – PM must use temp script file."""
+    if not turn_artifacts_path:
+        return
+    tap = Path(turn_artifacts_path)
+    if not tap.is_absolute():
+        tap = Path.cwd() / turn_artifacts_path
+    if not tap.exists():
+        return
+    data = _safe_read_json(tap)
+    if not isinstance(data, (list, dict)):
+        return
+    calls = []
+    if isinstance(data, list):
+        calls = data
+    else:
+        for k in ("tools", "calls", "tool_calls", "events"):
+            if isinstance(data.get(k), list):
+                calls = data[k]
+                break
+    for c in calls:
+        if not isinstance(c, dict):
+            continue
+        nm = (c.get("name") or c.get("tool") or c.get("type") or "").lower()
+        if nm != "exec":
+            continue
+        cmd = str(c.get("command") or c.get("cmd") or c.get("input") or "")
+        # Pattern: python -c "..." where the content after -c has newlines
+        # (i.e. it was a multi-line python -c that PowerShell mangled)
+        if not cmd:
+            continue
+        # Check for python -c pattern
+        cmd_lower = cmd.lower()
+        # Match: python -c "..." or python -c '...'
+        import re as _re
+        inline_match = _re.search(r"python\s+-c\s+[\"'](.{20,})[\"']", cmd, _re.DOTALL)
+        if inline_match:
+            content = inline_match.group(1)
+            # If content contains real newlines (0x0A) or backslash-n sequences,
+            # it's a long inline script that will get mangled by PowerShell
+            if "\n" in content or "\\n" in content:
+                rep.add("FAIL", "TOOL_SYNTAX_VIOLATION",
+                        "T003: DO NOT use python -c with multi-line content. "
+                        "Use a temp .py script file instead. Command was too long. "
+                        "See: AGENTS.md § 'Python inline exec forbidden'")
+                return
+
+
 def check_turn_gate_head(rep):
     rep.add("OK", "TURN_GATE", "head mode; TURN_GATE enforced at tail")
 
 
 def _encoding_targets(root, n=5):
-    cands = []
-    for gl in ("scripts/*.py", "docs/adr/*.md", "memory/*.md", "*.md"):
-        for p in root.glob(gl):
-            try:
-                cands.append((p.stat().st_mtime, p))
-            except OSError:
-                pass
-    cands.sort(reverse=True)
-    out = []
+    """Return list of files to scan for BOM/CRLF.
+
+    Always scans (deterministically):
+      - docs/*.md   (new — C031, exclude docs/domain/ via rglob guard below)
+      - memory/*.md (existing)
+      - docs/adr/*.md (existing)
+      - scripts/*.py (existing)
+    Plus top-N most-recently-modified root *.md (existing meta files).
+    Skips docs/domain/ per project rule (business doc exclusion zone).
+    """
     seen = set()
-    for _, p in cands:
-        rp = p.resolve()
+    out = []
+
+    def _add(p):
+        try:
+            rp = p.resolve()
+        except OSError:
+            return
+        if not p.is_file():
+            return
         if rp in seen:
-            continue
-        seen.add(rp)
+            return
         if any(part in SKIP_DIRS for part in rp.parts):
-            continue
+            return
+        # docs/domain/ exclusion zone (C031: business docs off-limits)
+        rel_parts = rp.parts
+        if "docs" in rel_parts and "domain" in rel_parts:
+            return
+        seen.add(rp)
         out.append(p)
-        if len(out) >= n:
-            break
+
+    # Deterministic full scan: docs/*.md + memory/*.md + docs/adr/*.md + scripts/*.py
+    for gl in ("docs/*.md", "memory/*.md", "docs/adr/*.md", "scripts/*.py"):
+        for p in root.glob(gl):
+            _add(p)
+    # Top-N most-recent root *.md (preserve original 'recent root meta' sampling)
+    root_md = []
+    for p in root.glob("*.md"):
+        try:
+            root_md.append((p.stat().st_mtime, p))
+        except OSError:
+            pass
+    root_md.sort(reverse=True)
+    for _, p in root_md[:n]:
+        _add(p)
     return out
 
 
@@ -719,6 +794,9 @@ def check_encoding(root, rep):
                 "no scripts/*.py or docs/adr/*.md found to sample")
         return
     bad = []
+    syntax_bad = []
+    last = _load_last_scan(root)
+    new_or_modified = []
     for p in files:
         b = p.read_bytes() if p.exists() else b""
         probs = []
@@ -730,17 +808,138 @@ def check_encoding(root, rep):
             b.decode("utf-8")
         except UnicodeDecodeError:
             probs.append("NON_UTF8")
+        # Track which files are new or modified since last scan (C038)
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            mt = 0.0
+        # Normalize to forward slashes for cross-platform cache key stability
+        # (Windows rel() returns backslashes; cache keys must be uniform).
+        relp = rel(p, root).replace("\\", "/")
+        prev_mt = last.get(relp)
+        is_new_or_modified = (prev_mt is None) or (mt > prev_mt + 0.0001)
         if probs:
-            bad.append(rel(p, root) + ":" + ",".join(probs))
-    if bad:
-        rep.add("FAIL", "ENCODING_SANITY", " | ".join(bad))
+            bad.append(relp + ":" + ",".join(probs))
+        # PY_COMPILE: syntax check for .py files
+        if p.suffix == ".py" and b:
+            try:
+                code = b.decode("utf-8", errors="replace")
+                compile(code, str(p), "exec")
+            except (SyntaxError, ValueError, TypeError) as e:
+                # Detect literal \n vs real newline issue (write tool bug)
+                # b"\\n" in bytes is literal backslash (5C) + n (6E)
+                if b"\\n" in b:
+                    syntax_bad.append(
+                        relp + ": SYNTAX_ERROR (\n escaped as literal backslash-n, "
+                        "likely write tool bug: " + str(e).splitlines()[0][:120]
+                    )
+                else:
+                    syntax_bad.append(
+                        relp + ": SYNTAX_ERROR: " + str(e).splitlines()[0][:120]
+                    )
+        if is_new_or_modified:
+            new_or_modified.append(relp)
+    # Partition bad/syntax into new-or-modified (FAIL) vs old (WARN for compat)
+    new_bad = [x for x in bad if x.split(":", 1)[0] in new_or_modified]
+    old_bad = [x for x in bad if x.split(":", 1)[0] not in new_or_modified]
+    new_syntax = [x for x in syntax_bad if x.split(":", 1)[0] in new_or_modified]
+    old_syntax = [x for x in syntax_bad if x.split(":", 1)[0] not in new_or_modified]
+    if syntax_bad:
+        if new_syntax:
+            rep.add("FAIL", "ENCODING_SANITY",
+                    "py_compile failed (NEW/MODIFIED file, C038): "
+                    + " | ".join(new_syntax))
+        if old_syntax:
+            rep.add("WARN", "ENCODING_SANITY",
+                    "py_compile failed (pre-existing file, not re-checked as FAIL): "
+                    + " | ".join(old_syntax))
+        if not new_syntax:
+            # only old syntax bad -> downgrade to WARN
+            pass
+    elif new_bad:
+        rep.add("FAIL", "ENCODING_SANITY",
+                "encoding bad (NEW/MODIFIED file, C038): "
+                + " | ".join(new_bad))
+        if old_bad:
+            rep.add("WARN", "ENCODING_SANITY",
+                    "encoding bad (pre-existing, not re-checked as FAIL): "
+                    + " | ".join(old_bad))
+    elif old_bad:
+        rep.add("WARN", "ENCODING_SANITY",
+                "encoding bad (pre-existing, not re-checked as FAIL): "
+                + " | ".join(old_bad))
     else:
         rep.add("OK", "ENCODING_SANITY",
-                "sample " + str(len(files)) + " recent .py/.md UTF-8 no BOM LF-only")
+                "sample " + str(len(files))
+                + " recent .py/.md UTF-8 no BOM LF-only, py_compile OK"
+                + (" (" + str(len(new_or_modified)) + " new/modified)" if new_or_modified else ""))
+    # Always save current scan snapshot for next-run diff (C038 incremental)
+    try:
+        _save_last_scan(root, files)
+    except Exception:
+        # Cache write failure is non-fatal; precheck already reported
+        pass
 
 
 def _epoch_path(root):
     return root / EPOCH_REL
+
+
+def _last_encoding_scan_path(root):
+    return root / LAST_ENCODING_SCAN_REL
+
+
+def _load_last_scan(root):
+    """Load previous encoding-scan snapshot.
+
+    Returns dict[relpath:str -> mtime:float]. Empty dict if cache missing/corrupt.
+    C038: powers incremental CRLF/BOM/NON_UTF8 detection across turns.
+    """
+    p = _last_encoding_scan_path(root)
+    if not p.exists():
+        return {}
+    data = _safe_read_json(p)
+    if not isinstance(data, dict):
+        return {}
+    files = data.get("files")
+    if not isinstance(files, dict):
+        return {}
+    out = {}
+    for k, v in files.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            out[k] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_last_scan(root, files):
+    """Persist current encoding-scan snapshot for next-run diff.
+
+    Writes UTF-8 LF no-BOM via tmp+os.replace (same atomic style as write_epoch).
+    Stores relpath -> mtime. C038 incremental cache.
+    """
+    p = _last_encoding_scan_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    snap = {"version": 1, "files": {}}
+    for f in files:
+        try:
+            # Use the same rel() helper that check_encoding uses, so the cache
+            # key matches what the next-run diff will look up. This also keeps
+            # Windows 8.3 short paths consistent across write/read turns.
+            # Normalize to forward slashes for cross-platform cache key
+            # stability (matches the diff-side lookup in check_encoding).
+            relp = rel(f, root).replace("\\", "/")
+            mt = float(Path(f).stat().st_mtime)
+        except (OSError, ValueError):
+            continue
+        snap["files"][relp] = mt
+    tmp = p.with_suffix(".json.tmp")
+    txt = json.dumps(snap, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    tmp.write_bytes(txt.encode("utf-8"))
+    os.replace(tmp, p)
 
 
 def write_epoch(root, now, summary, head_ok):
@@ -791,11 +990,11 @@ def check_epoch_tail(root, now, rep):
     return data
 
 
-def _check_inputs_present(root, transcript, last_assistant, workers,
+def _check_inputs_present(root, transcript, last_assistant_file, workers,
                           turn_artifacts, rep):
     checks = [
         ("transcript", transcript),
-        ("last_assistant", last_assistant),
+        ("last_assistant_file", last_assistant_file),
         ("workers", workers),
     ]
     if turn_artifacts is not None:
@@ -814,7 +1013,7 @@ def _check_inputs_present(root, transcript, last_assistant, workers,
                     + name.upper() + "-dependent checks")
 
 
-def _run_head_checks(root, transcript, last_assistant, workers, now, rep):
+def _run_head_checks(root, transcript, last_assistant_file, workers, now, rep):
     """Run the v1-compatible 6 base checks (TURN_GATE is head placeholder)."""
     try:
         check_commitments(root, now, rep)
@@ -825,11 +1024,11 @@ def _run_head_checks(root, transcript, last_assistant, workers, now, rep):
     except Exception as e:
         rep.add("FAIL", "WORKER_TIMEOUT", "internal error: " + str(e))
     try:
-        check_need_poll(root, transcript, last_assistant, workers, now, rep)
+        check_need_poll(root, transcript, last_assistant_file, workers, now, rep)
     except Exception as e:
         rep.add("FAIL", "NEED_POLL", "internal error: " + str(e))
     try:
-        check_fake_done(transcript, last_assistant, rep, mode="head")
+        check_fake_done(transcript, last_assistant_file, rep, mode="head")
     except Exception as e:
         rep.add("FAIL", "FAKE_DONE", "internal error: " + str(e))
     try:
@@ -840,6 +1039,121 @@ def _run_head_checks(root, transcript, last_assistant, workers, now, rep):
         check_encoding(root, rep)
     except Exception as e:
         rep.add("FAIL", "ENCODING_SANITY", "internal error: " + str(e))
+    try:
+        check_tool_patterns_head(root, last_assistant_file, rep)
+    except Exception as e:
+        rep.add("FAIL", "TOOL_PATTERNS", "internal error: " + str(e))
+
+
+def check_tool_patterns_head(root, last_assistant_file, rep):
+    """T003: Check exec patterns in last-assistant text (head mode fallback).
+
+    When turn-artifacts is not available, grep the assistant's message text
+    for exec commands matching dangerous patterns.
+    """
+    if not last_assistant_file:
+        return
+    ap = Path(last_assistant_file)
+    if not ap.exists():
+        return
+    text = _safe_read_text(ap)
+    if not text:
+        return
+    # Extract exec commands from text
+    exec_match = re.findall(
+        r'exec\s*\(\s*["\']([^"\'])',
+        text,
+    )
+    for cmd in exec_match:
+        for pattern, msg in [
+            (r"python\s+-c\s+[\"\'](.{50,})", "python -c long inline"),
+            (r"Set-Content", "Set-Content write"),
+            (r"Out-File", "Out-File write"),
+        ]:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                rep.add("FAIL", "TOOL_PATTERNS",
+                        "T003: " + msg + " found in exec: " + cmd[:80])
+                return
+    rep.add("OK", "TOOL_PATTERNS", "no dangerous patterns in exec commands")
+
+
+def check_tool_patterns(root, turn_artifacts_path, rep):
+    """T003: Scan turn-artifacts for exec commands matching dangerous patterns.
+
+    Catches:
+      - python -c with long content (PowerShell escaping bug)
+      - Set-Content / Out-File / Write-Host writing to files
+      - cat > heredoc / sed -i / echo > file
+      - 任何写文件模式（A012 禁令）
+    """
+    if not turn_artifacts_path:
+        rep.add("WARN", "TOOL_PATTERNS",
+                "--turn-artifacts not provided, skipping TOOL_PATTERNS")
+        return
+    tap = Path(turn_artifacts_path)
+    if not tap.is_absolute():
+        tap = root / tap
+    if not tap.exists():
+        rep.add("WARN", "TOOL_PATTERNS",
+                "turn-artifacts missing, skipping TOOL_PATTERNS")
+        return
+    data = _safe_read_json(tap)
+    if not isinstance(data, (list, dict)):
+        return
+    calls = []
+    if isinstance(data, list):
+        calls = data
+    else:
+        for k in ("tools", "calls", "tool_calls", "events"):
+            if isinstance(data.get(k), list):
+                calls = data[k]
+                break
+
+    # Dangerous patterns: each is (regex, friendly_message)
+    DANGEROUS_PATTERNS = [
+        (r"python\s+-c\s+[\"\'](.{50,})[\"\']",
+         "python -c with long inline code (>50 chars): PowerShell escaping bug. Use temp .py file."),
+        (r"Set-Content\s+[\"']?\S+[\"']?\s*[-\s]\w*Encoding",
+         "Set-Content with -Encoding: GBK/BOM/CRLF corruption risk."),
+        (r"Set-Content\s+.*[\"'][\r\n]",
+         "Set-Content with here-string/inline content: write content is not safe in exec."),
+        (r"Out-File\s+.*[-\s]\w*Encoding",
+         "Out-File with -Encoding: encoding corruption risk."),
+        (r"Write-Host\s+.*>\s*\S+",
+         "Write-Host > file: stdout redirect, content may be mangled."),
+        (r"Write-Output\s+.*>\s*\S+",
+         "Write-Output > file: redirect output, encoding risk."),
+        (r"echo\s+.*>\s*\S+\.(py|js|ts|json|yaml|yml|md)",
+         "echo > file (cmd): write file content via echo."),
+        (r"cat\s+>.*<<", r"cat > ... << heredoc: bash heredoc write."),
+        (r"\bsed\s+-i\b",
+         "sed -i: in-place file editing via shell."),
+        (r"tee\s+.*>\s*\S+\.(py|js|ts|json)",
+         "tee > file: redirecting to source file."),
+        (r"\bif\s+.*[-]RedirectStandardOutput\b",
+         "RedirectStandardOutput > file: redirecting command output to source file."),
+    ]
+
+    for c in calls:
+        if not isinstance(c, dict):
+            continue
+        nm = (c.get("name") or c.get("tool") or c.get("type") or "").lower()
+        if nm != "exec":
+            continue
+        cmd = str(c.get("command") or c.get("cmd") or c.get("input") or "")
+        if not cmd:
+            continue
+        for pattern, msg in DANGEROUS_PATTERNS:
+            if re.search(pattern, cmd, re.IGNORECASE | re.DOTALL):
+                # Trim command for display (max 100 chars)
+                cmd_snippet = cmd[:100].replace("\n", "\\n").replace("\r", "\\r")
+                rep.add("FAIL", "TOOL_PATTERNS",
+                        "exec command blocked: " + msg
+                        + " | cmd=" + cmd_snippet + "...")
+                return
+
+    rep.add("OK", "TOOL_PATTERNS",
+            "no dangerous exec patterns detected in turn")
 
 
 def _load_artifacts(root, turn_artifacts, rep):
@@ -892,10 +1206,16 @@ def run(root, mode="head", last_assistant_file=None, transcript=None,
     # 4) bypass detection (degrades gracefully)
     check_bypass(root, turn_artifacts, rep)
 
-    # 5) real TURN_GATE: visible output check (files / artifacts)
+    # 5) T003: exec command pattern check (tail: uses turn-artifacts)
+    try:
+        check_tool_patterns(root, turn_artifacts, rep)
+    except Exception as e:
+        rep.add("FAIL", "TOOL_PATTERNS", "internal error: " + str(e))
+
+    # 6) real TURN_GATE: visible output check (files / artifacts)
     turn_has_output = check_turn_gate(root, now, artifacts_data, rep)
 
-    # 6) FAKE_DONE_TAIL: declared done + no visible output
+    # 7) FAKE_DONE_TAIL: declared done + no visible output
     try:
         check_fake_done(transcript, last_assistant_file, rep, mode="tail",
                         turn_has_output=turn_has_output)

@@ -10,6 +10,15 @@ from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QGraphicsView, QToolTip, QVBoxLayout, QWidget
 
+# C050 P0A 折线图降采样 (C049 root cause: 同源 C046 主线程串行渲染)
+# 复用 process_analysis_panel 的 C048 helper (同源 C046 LOESS fallback 卡死),
+# chart_panel 跟 process_analysis_panel 是两个独立模块, 但都用同一份降采样实现,
+# 避免代码冗余 + 阈值漂移。
+from app.ui.widgets.process_analysis_panel import (
+    MAX_RENDER_POINTS,            # 5000
+    _downsample_for_render,       # 纯函数 (x, resid) -> (x_ds, resid_ds, n_orig)
+)
+
 GRAN_RAW = "原始"
 GRAN_MIN = "分钟"
 GRAN_HOUR = "小时"
@@ -43,6 +52,38 @@ _MAX_PLOT_POINTS = 3000
 _HOVER_TOLERANCE_PX = 18
 
 _log = logging.getLogger(__name__)
+
+
+# C050 P0A 折线图降采样 (C049 root cause: 同源 C046 主线程串行渲染)
+def _downsample_with_labels(
+    xs: "np.ndarray",
+    ys: "np.ndarray",
+    x_labels: "np.ndarray",
+    max_points: int = MAX_RENDER_POINTS,
+    seed: int = 42,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, int]":
+    """折线图小多图专用: 在 _downsample_for_render 基础上加 x_labels 同步降采样。
+
+    C050 P0A: 复用 C048 helper 的核心采样逻辑 (np.random.default_rng(seed) +
+    np.sort(rng.choice)), 通过把 (xs, ys) 输入 _downsample_for_render, 然后对
+    x_labels (对象数组/字符串) 应用同样的索引, 保证 xs/ys/x_labels 三者始终保持
+    原索引对应 (散点 + 折线 + x 轴 tick label 视觉一致)。
+
+    n <= max_points 时不降采样 (与 C048 helper 行为一致, DoD 硬约束)。
+    """
+    xs_ds, ys_ds, n_orig = _downsample_for_render(
+        xs, ys, max_points=max_points, seed=seed
+    )
+    if int(xs_ds.shape[0]) == int(np.asarray(xs).shape[0]):
+        # n<=max_points 未降采样, x_labels 原样返回
+        return xs_ds, ys_ds, x_labels, n_orig
+    n = int(np.asarray(xs).shape[0])
+    # 已降采样: 对 x_labels 应用同样的 np.random.default_rng(seed) + np.sort(rng.choice)
+    rng = np.random.default_rng(int(seed))
+    idx = np.sort(rng.choice(n, int(max_points), replace=False))
+    labels_arr = np.asarray(x_labels)
+    labels_ds = labels_arr[idx]
+    return xs_ds, ys_ds, labels_ds, n_orig
 
 
 class ChartPanel(QWidget):
@@ -614,6 +655,31 @@ class ChartPanel(QWidget):
                 "color": qcolor.name(),
                 "x_labels": x_labels_full,
             })
+
+            # C050 P0A 折线图多小图模式降采样 (C049 root cause: 同源 C046 主线程串行渲染):
+            # 每个 y_col 子图入口: show_points=True 且 n>MAX_RENDER_POINTS 时降到 5000 点,
+            # xs/ys/x_labels 三者同步降采样 (复用 C048 helper, 同一组采样点 + np.sort 回原顺序),
+            # 折线图路径 (曲线 + 散点) 共用同一组采样点避免"对不上"。show_points=False 时跳过
+            # (不画点就没必要降)。均值线 / 子图标题 / x 轴 / 子图布局 全部保留照旧。
+            n_orig_sub = int(len(xs_full))
+            if show_points and n_orig_sub > MAX_RENDER_POINTS:
+                xs_full, ys_full, x_labels_full, _ = _downsample_with_labels(
+                    xs_full, ys_full, x_labels_full, max_points=MAX_RENDER_POINTS,
+                )
+                _log.info(
+                    "C050 P0A downsample y_col=%s n_orig=%d -> n_ds=%d",
+                    y_col, n_orig_sub, len(xs_full),
+                )
+                # 同步更新 _sm_full_series (供悬停光标读原始点时仍能定位到降采样索引)
+                self._sm_full_series[-1] = {
+                    "name": y_col,
+                    "xs": xs_full,
+                    "ys": ys_full,
+                    "color": qcolor.name(),
+                    "x_labels": x_labels_full,
+                }
+                # total_full_points 在第一个循环已用 n_orig_sub 累加过,
+                # 这里只更新 _sm_full_series 即可 (保持消息里的"数据点共 {} 个"是原始样本量)。
 
             xs_plot, ys_plot = self._downsample(xs_full, ys_full, _MAX_PLOT_POINTS)
             total_plot_points += len(xs_plot)

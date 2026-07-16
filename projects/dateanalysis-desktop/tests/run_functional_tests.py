@@ -180,4 +180,29 @@ check("infer_datetime_series 时间列全部解析", dt_s.notna().all() and dt_s
 
 print("----")
 print(f"PASSED: {passed}  FAILED: {failed}")
+
+# 9. UI smoke test (ui_smoke_test via pytest, offscreen Qt)
+import subprocess as _sp
+smoke_path = PROJECT_ROOT / "tests" / "ui_smoke_test.py"
+print("\n==== [9] UI smoke test (pytest, offscreen) ====")
+try:
+    result = _sp.run(
+        [sys.executable, "-m", "pytest", str(smoke_path), "-x", "-v", "--timeout=120"],
+        capture_output=True, text=True, timeout=360,
+    )
+    print(result.stdout)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr)
+    if result.returncode != 0:
+        failed += 1
+        print(f"[FAIL] ui_smoke_test exited {result.returncode}")
+    else:
+        passed += 1
+        print("[PASS] ui_smoke_test ALL PASSED")
+except Exception as exc:
+    failed += 1
+    print(f"[FAIL] ui_smoke_test exception: {exc}")
+
+print("\n----")
+print(f"FINAL PASSED: {passed}  FINAL FAILED: {failed}")
 sys.exit(0 if failed == 0 else 1)

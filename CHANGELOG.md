@@ -1,66 +1,85 @@
-# CHANGELOG — 脱模优化_数据分析 PM
+## 2026-07-16
 
-> 格式：版本/时间/摘要/凭证；最近在上。
+### 10:08 — C047 5Hz 心跳日志 CLOSED（7m30s / Owner 抓证据基础设施就绪）
+- **触发**：Owner 09:52 报归因分析 100% 卡死 → PM 09:55 派 C046 investigator + C047 coder 并行
+- **范围**：`head_tail_attribution.py` + `process_analysis_panel.py`
+- **改动**：
+  - `head_tail_attribution.py` 33349 → 35096 (+1747B / +5%)
+  - `process_analysis_panel.py` 94433 → 95552 (+1119B / +1.2%)
+- **7 埋点齐**：
+  - `_call_progress` 每次（业务行为不变 + stderr 打 `[ATTR] t+...s pct=... msg`）
+  - `build_head_tail_report` ENTER / EXIT
+  - M1 `_partial_corr` / `_partial_corr_pg` 调用前后（带 feat 名 + 索引）
+  - M2 `_ols_standardized` 调用前后（带 n_used / k / r²）
+  - AI 解读 ENTER (L881) / EXIT (L933)
+  - `_render_chart3_grid` ENTER (L1917) / EXIT (L1957)
+  - `_render_chart3_subplot` ENTER (L1962) / EXIT (L2029)
+  - LOESS 三出口：statsmodels 成功 (L2011) / numpy 兜底成功 (L2025) / 全失败 (L2027)
+- **200ms 限流**：同样 (pct, msg) 200ms 内只打一次；pct 变化强制打（验证 5x 同 (pct,msg) → 1 print）
+- **验证**：
+  - py_compile 双文件 OK
+  - 185 passed / 2 warnings（与 baseline 同 / 心跳到 stderr 不影响测试断言）
+  - LF 干净 / 无 BOM（CRLF=0 / LF=930 / LF=2146）
+  - 临时脚本清理 count=0
+- **PM 立场**：C047 只加日志不改业务，**等 Owner 再点一次归因分析抓 [ATTR] 日志**（命令行窗口别关）→ 给 PM + C046 报告一起派 C048 修
 
-## V1.12.6 / W12.6 — 2026-07-13 13:20
-**P0** API Key 配置弹窗 EchoMode 报错修复（Owner现场反馈：点配置Key弹 AttributeError）
-- Bug：`QInputDialog.EchoMode.Password` 在 PySide6 里不存在，应为 `QLineEdit.EchoMode.Password`
-- 同步修正 `test_w12_head_tail_attribution.py` 取消测试断言（原断言 `"已取消"` 不匹配 `"已被用户取消"`）
-- 测试：125 passed
+### 09:55 — Owner 09:52 新反馈：归因分析 100% 卡死（p<20/n=百万/首次点卡）
+- **触发**：Owner 桌面验证 V1.13.1 时点归因分析，进度 100% 后卡死
+- **已知条件**：特征列 < 20 / 数据行 百万级 / **首次点就卡**
+- **已知修复**（不是此症状）：C033（算法 1.6s 跑完，"卡"是进度倒退视觉错觉）/ C034（进度单调递增 + 异常捕获 + Panel 内嵌 QProgressBar + 取消按钮）
+- **PM 派工**：C046 investigator 5 方向调查 + C047 coder 5Hz 心跳日志（并行，C047 不等 C046）
+- **PM 立场**：调查未完成前不修代码，不掩盖症状，等根因报告再决定 C048 修法
 
-## V1.12.5 / W12.5 — 2026-07-13 12:50
-**P0** 工艺分析启动无响应修复（Owner现场反馈：点开始分析后一直没结果）
-- 根因1：`_run_background` 缺 `cancel_event` 参数，调用处传了 → TypeError 被吞，按钮变灰无反应
-- 根因2：`do_work(rp=None)` 参数名不对，Worker 内省识别不到 → 进度条永远 0%，像卡住了
-- 修复：`_run_background` 加 `cancel_event=None` 参数并透传 `_set_busy`；两处 `do_work` 参数名改 `report_progress=None`
-- 测试：125 passed
+## 2026-07-15
 
-## V1.12.4 / W12.4 — 2026-07-13 11:50
-**P0** 工艺分析进度细化+取消按钮（Owner现场反馈：还没到AI，正常分析就卡住了）
-- `process_analysis.py`：`compute_univariate_windows` 增加 `progress_callback` / `cancel_event` / `pct_range` 参数，每 20% 特征任务回传一次进度
-- `process_analysis_panel.py`：QProgressDialog 加取消按钮，点击触发 cancel_event 提前终止分析
-- `main_window.py`：工艺分析调用链接入细粒度进度回调 + cancel_event 透传
-- 测试：125 passed（ui_smoke_test 为已知遗留，未纳入自动回归）
+### 19:55 — C038 跨 PM 同步 4 阶段流水线全部 CLOSED
+- **路径 A 落地**（Main 19:32 拍板）：改 AFE 真值源 + 主 workspace ADR-019 + sync + README 索引
+- **4 阶段**：
+  - C042 (coder 3m13s)：AFE `scripts/pm_turn_precheck.py` 39712→44762 (+5050B) + `tests/test_pm_turn_precheck.py` 3563→8655 (+5092B)
+  - C043 (documenter 6m23s)：`docs/adr/ADR-019-incremental-lf-precheck-cross-pm-rollout.md` 27457B（42 段落 / 18 ADR 引用 / 5 AFE 行号引用 / 27457B > ADR-017 20779B）
+  - C044 (investigator 3m26s)：sync exit 0 + 7 ws × 4 文件 = 28/28 字节数一致 + C038 增量检测 7/7 活命中
+  - C045 (documenter 1m28s)：`docs/adr/README.md` L17 追加 ADR-019 索引行（880→1060B / +180B / 17→18 行）
+- **总耗时**：14m30s 流水线执行 + 7m30s 验收 = **22min**（Main 30min 目标提前 27%）
+- **跨 PM workspace 覆盖**：7（main / industry / gongfeng / secretary / worksummary-pm / dataanalysis-pm / afe）
+- **ADR-019 核心**：C038 增量 LF 检查 + `.precheck/last_encoding_scan.json` 缓存 + a010_sync_gates.py 自动分发 + pre-existing 历史污染兼容（不 FAIL 只 WARN）
+- **关键副作用识别**：4 个 workspace 有 pre-existing CRLF/BOM 文件被 C038 正确捕获（**不是 sync 引入的回归**）
 
-## V1.12.3 / W12.3 — 2026-07-13 10:30
-AI按钮3bug修复+ai_config.json
-- 超时/停止后按钮 on_finished 兜底恢复
-- 配完Key状态栏反馈+按钮刷新
-- ai_config.json 支持 openai/deepseek 两套 base_url/model/api_key
-- 优先级：QSettings > 配置文件 > codex > env > PRESET
-- 测试：125 passed
+### 18:54 — C038 治本落地（Owner 18:41 拍板选 ②）
+- precheck ENCODING_SANITY 加"新增/修改文件即时 LF 检查"
+- 3 文件改动：scripts\pm_turn_precheck.py +4144B + tests\test_pm_turn_precheck_crlf_incremental.py 新 7343B 5 测试 PASS + .precheck\last_encoding_scan.json 1454B 缓存
+- 5 测试覆盖：test_first_scan_empty_cache / test_new_crlf_file_fails / test_new_lf_clean_file_ok / test_modified_existing_file_to_crlf_fails / test_pre_existing_crlf_with_cache_warns
+- 治本生效：Precheck 输出 "(N new/modified)" 标识命中
 
-## V1.12.2 / W12.2 — 2026-07-13 09:56
-AI 超时可配置（5~300s SpinBox + QSettings 持久化 + 状态栏动态显示）
+### 18:32 — C037-B target_col 解耦 ACCEPTED
+- 4 文件改动：panel.py 90393→94433 / main_window.py 90509→90604 / head_tail_attribution.py 34190→33349 / test_s5_target_col_decouple.py 新
+- 全量回归 185 passed / 0 warnings
+- L1200/L1378/L1361 解耦 + L1518 fallback 保留 + L1045-1046 state_combo 行为保留
 
-## V1.12.1 / W12.1 — 2026-07-13 09:45
-AI 锁与超时热修复（双锁拆分 + 停止按钮 + 软取消 + 30s 超时）
+### 18:22 — C037-C S5 Tab splitter ACCEPTED
+- 1 文件改动：process_analysis_panel.py +1516B (88877→90393)
+- QSplitter(Qt.Vertical) setStretchFactor(0,3)/(1,3)/(2,2)
+- 全量回归 180→185 passed / 0 warnings
 
-## V1.12.0 / W12 — 2026-07-13 08:59
-机尾指数-s归因模式（方案B）。120 passed。
+### 16:01 — C037-A AI 解读覆盖多变 CLOSED
+- 2 文件改动：ai_prompt.py 11346→15585 (+4239B) / test_s5_ai_prompt_multi.py 新 7810
+- 5 测试 PASS / 全量回归 175 passed / 0 warnings
+- PM 救火 342 CRLF → LF（C038 治本触发点）
 
-## V1.11.0 / W11 — 2026-07-11 15:05
-AI 解读超时修复：自动读取 ~/.codex/config.toml 与环境变量作为默认 endpoint/model。
-- 新增 app/services/ai_config.py（纯函数，tomllib 解析 py3.12 stdlib）
-- 凭证：108 passed, 0 warnings
+### 15:56 — C034 修归因卡顿 CLOSED
+- 4 文件改动：head_tail_attribution.py +221 / main_window.py +542 / panel +2081 / test_s5_attribution_progress.py 新 8000
+- 6 新测试 PASS / 全量回归 170 passed / 0 warnings
+- C033 根因确认：算法 1.6s 跑完，"卡"是进度条倒回视觉错觉
 
-## V1.10.1 / W10 — 2026-07-11 13:55
-右Dock宽度+节点悬停tooltip。103 passed。
+### 15:34 — C031 CRLF 治本 3 件套 CLOSED
+- 4 文件改动：.gitattributes 377B + pm_turn_precheck.py +906B + SKILL.md +494B + test_s5_gitattributes_eol.py 新
+- 2 测试 PASS / 4m33s
 
-## V1.10.0 / W9 — 2026-07-11 13:00
-三栏可收起+AI URL可输入。98 passed。
+### 14:46 — C029 ADR-007 落档
+- docs/adr/2026-07-15-skill-workshop-approve-timeout.md 12158B / 141 行
+- 三合一：skill-workshop apply bug + CRLF 污染 + 子代理死锁教训
 
-## V1.9.0 / W8 — 2026-07-11 12:15
-工艺窗口分析+AI解读。91 passed。
+### 14:31 — Sprint 5 / V1.13.0 完成
+- 162 passed / 0 warnings / 0 regressions
+- 归因分析升级（多变量 + UI + AI 解读）
 
-## V1.8.x — 2026-07-11
-文件夹批量/跨类、排除列、Y轴四模式、小多图、导出修复。55 passed。
-
-## V1.7.0 — 2026-07-11 00:30
-机头/机尾跨类同图。37 passed。
-## V1.12.7 / W12.7 — 2026-07-13 16:26
-**P0** ai_client.py 字面 \n SyntaxError 热修复（Owner现场反馈：软件启动直接崩）
-- 根因：W12 系列迭代中写入 ai_client.py 时，8 处 \n 被写成字面反斜杠+n而非真实换行
-- 影响：rom app.services.ai_client import AIClient 直接 SyntaxError，主程序无法启动
-- 修复：脚本批量替换 8 处字面 \n 为真实 LF 换行
-- 测试：ast.parse 通过 + 核心测试 125 passed（ui_smoke_test 为已知遗留，未纳入自动回归）
+---

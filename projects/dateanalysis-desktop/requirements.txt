@@ -5,3 +5,6 @@ openpyxl>=3.1
 xlrd==1.2.0
 pyqtgraph>=0.13
 scipy>=1.10,<2.0
+# S5 多变量归因可选精化路径（缺失时主路径降级到 numpy 残差法）
+pingouin>=0.5.3
+
